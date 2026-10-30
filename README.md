@@ -1,4 +1,9 @@
-<h1 align="center">Sigil Code</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
+    <img src="docs/images/logo-light.png" alt="Sigil Code" width="420">
+  </picture>
+</p>
 
 <p align="center">
   <b>An open-source AI coding agent for your terminal.</b><br>

@@ -97,5 +97,3 @@ First public release.
 
 - Requires Python 3.10 or later. Core dependencies: `prompt_toolkit` and `rich`. Optional extras:
   `pdf`, `yaml`, `ast`, `tokenizers`, `dev`, `all`.
-- Upgrading from the preview: project files moved from `.claude/` to `.sigil/` and `CLAUDE.md` to
-  `SIGIL.md`; rename them in existing projects.
