@@ -30,25 +30,33 @@ def _resolve_bash_executable(env: Any = None, which: Any = None, exists: Any = N
     value = str(env.get('SIGIL_GIT_BASH_PATH') or '').strip().strip('"')
     if value and exists(value):
         return value
-    system_root = str(env.get('SystemRoot') or env.get('SYSTEMROOT') or r'C:\Windows').lower()
+    import ntpath
+    from pathlib import PureWindowsPath  # Windows path rules on any host (this branch is the Windows lookup)
+
+    def _norm(value: Any) -> str:  # case-insensitive, either slash: C:/Windows == c:\WINDOWS
+        return ntpath.normcase(ntpath.normpath(str(value)))
+
+    system32 = _norm(ntpath.join(str(env.get('SystemRoot') or env.get('SYSTEMROOT') or r'C:\Windows'), 'System32'))
     on_path = which('bash')
     if on_path:
-        lowered = str(on_path).lower()
-        if not (lowered.startswith(system_root + '\\system32') or '\\windowsapps\\' in lowered):
+        lowered = _norm(on_path)
+        # skip the WSL launcher (System32 / WindowsApps); the comparison used backslash text only, so
+        # a path written with forward slashes picked WSL bash
+        if not (lowered.startswith(system32 + '\\') or '\\windowsapps\\' in lowered):
             if exists(on_path):
                 return str(on_path)
-    from pathlib import Path  # this runs at import time, before the module's own import below
 
-    candidates: list[Path] = []
+    candidates: list[PureWindowsPath] = []
     git = which('git')
     if git:
-        for parent in list(Path(git).parents)[:3]:  # <Git>\cmd\git.exe, <Git>\mingw64\bin\git.exe
+        for parent in list(PureWindowsPath(git).parents)[:3]:  # <Git>\cmd\git.exe, <Git>\mingw64\bin\git.exe
             candidates += [parent / 'bin' / 'bash.exe', parent / 'usr' / 'bin' / 'bash.exe']
     for base in (env.get('ProgramFiles'), env.get('ProgramW6432'), env.get('ProgramFiles(x86)')):
         if base:
-            candidates += [Path(base) / 'Git' / 'bin' / 'bash.exe', Path(base) / 'Git' / 'usr' / 'bin' / 'bash.exe']
+            candidates += [PureWindowsPath(base) / 'Git' / 'bin' / 'bash.exe',
+                           PureWindowsPath(base) / 'Git' / 'usr' / 'bin' / 'bash.exe']
     if env.get('LOCALAPPDATA'):
-        candidates.append(Path(env['LOCALAPPDATA']) / 'Programs' / 'Git' / 'bin' / 'bash.exe')
+        candidates.append(PureWindowsPath(env['LOCALAPPDATA']) / 'Programs' / 'Git' / 'bin' / 'bash.exe')
     for candidate in candidates:
         if exists(str(candidate)):
             return str(candidate)

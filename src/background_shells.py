@@ -271,16 +271,15 @@ def kill_process_tree(process: subprocess.Popen[Any], win_job: Any = None) -> No
         subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
                        capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
     else:
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+        from .process_group import safe_killpg
+
+        # only the shell's own group (it was started in its own session); never ours (CI runner killed)
+        if safe_killpg(process.pid, signal.SIGTERM):
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired as _ignored:
                 _log_ignored(_ignored)
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError) as _ignored:
-            _log_ignored(_ignored)
-            pass
+                safe_killpg(process.pid, signal.SIGKILL)
     try:
         process.kill()
     except OSError as _ignored:

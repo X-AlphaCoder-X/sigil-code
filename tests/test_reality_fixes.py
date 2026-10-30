@@ -359,27 +359,47 @@ class BareFlagsTests(unittest.TestCase):
 
 
 class BashLookupTests(unittest.TestCase):
-    """F16: no machine-specific fallback; Git Bash found the documented ways; WSL launcher skipped."""
+    """F16: no machine-specific fallback; Git Bash found the documented ways; WSL launcher skipped.
+    The Windows lookup is simulated explicitly (Windows path semantics), so it is checked on any OS."""
 
     def resolve(self, env: dict, on_path: dict, existing: set) -> str:
+        import ntpath
+
         from src.agent_tools import _resolve_bash_executable
 
+        present = {ntpath.normcase(path) for path in existing}
         return _resolve_bash_executable(env=env, which=lambda name: on_path.get(name),
-                                        exists=lambda path: str(path) in existing, platform='win32')
+                                        exists=lambda path: ntpath.normcase(str(path)) in present,
+                                        platform='win32')
 
     def test_order(self) -> None:
-        git_bash = str(Path('D:/Tools/Git/bin/bash.exe'))
-        own = str(Path('E:/b/bash.exe'))
+        from pathlib import PureWindowsPath as WinPath
+
+        git_bash = str(WinPath('D:/Tools/Git/bin/bash.exe'))
+        own = str(WinPath('E:/b/bash.exe'))
         self.assertEqual(self.resolve({'SIGIL_GIT_BASH_PATH': own}, {}, {own}), own)
-        wsl = {'bash': str(Path('C:/Windows/System32/bash.exe')), 'git': str(Path('D:/Tools/Git/cmd/git.exe'))}
-        self.assertEqual(self.resolve({'SystemRoot': str(Path('C:/Windows'))}, wsl, {wsl['bash'], git_bash}),
+        wsl = {'bash': str(WinPath('C:/Windows/System32/bash.exe')), 'git': str(WinPath('D:/Tools/Git/cmd/git.exe'))}
+        self.assertEqual(self.resolve({'SystemRoot': str(WinPath('C:/Windows'))}, wsl, {wsl['bash'], git_bash}),
                          git_bash)
-        program_files = str(Path('C:/Program Files/Git/bin/bash.exe'))
-        self.assertEqual(self.resolve({'ProgramFiles': str(Path('C:/Program Files'))}, {}, {program_files}),
+        program_files = str(WinPath('C:/Program Files/Git/bin/bash.exe'))
+        self.assertEqual(self.resolve({'ProgramFiles': str(WinPath('C:/Program Files'))}, {}, {program_files}),
                          program_files)
 
+    def test_wsl_launcher_skipped_whatever_the_slashes(self) -> None:
+        """The System32 / WindowsApps check compared backslash text only: `C:/Windows/System32/bash.exe`
+        (or a `SystemRoot` written with forward slashes) picked the WSL launcher."""
+        git = r'D:\Tools\Git\cmd\git.exe'
+        git_bash = r'D:\Tools\Git\bin\bash.exe'
+        for root, launcher in ((r'C:\Windows', 'C:/Windows/System32/bash.exe'),
+                               ('C:/Windows', r'C:\WINDOWS\system32\bash.exe'),
+                               (r'C:\Windows', 'C:/Users/u/AppData/Local/Microsoft/WindowsApps/bash.exe')):
+            self.assertEqual(self.resolve({'SystemRoot': root}, {'bash': launcher, 'git': git},
+                                          {launcher, git_bash}), git_bash, (root, launcher))
+
     def test_no_machine_specific_path(self) -> None:
-        conda = str(Path('C:/ProgramData/miniconda3/Library/usr/bin/bash.exe'))
+        from pathlib import PureWindowsPath as WinPath
+
+        conda = str(WinPath('C:/ProgramData/miniconda3/Library/usr/bin/bash.exe'))
         self.assertEqual(self.resolve({}, {}, {conda}), '/bin/bash')  # none found: the PowerShell tool takes over
 
 

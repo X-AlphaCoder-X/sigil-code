@@ -29,9 +29,9 @@ Sigil Code is a coding agent that works in your terminal. You describe the chang
 
 - Small and local models keep working. They often stall: an empty reply, a raw `<use_tool>` XML dump, or "I'll now run..." with no tool call after it. Auto-nudge spots these and gets the model moving again, and a message sanitizer fixes the payloads that make strict providers answer with HTTP 400.
 - Windows is a first-class platform, with no WSL needed. Git-Bash path translation and `msvcrt` keyboard input are built in, and Linux and macOS work too.
-- You can read all of it. Sigil is about 50k lines of plain Python across 104 modules, with two core dependencies (`prompt_toolkit` and `rich`). If you want it to behave differently, the code is right there.
+- You can read all of it. Sigil is about 50k lines of plain Python across 105 modules, with two core dependencies (`prompt_toolkit` and `rich`). If you want it to behave differently, the code is right there.
 - The full agent toolkit comes in the box: parallel tool calls, context compaction, sub-agents and background agents, checkpoints and `/rewind`, hooks, skills, custom commands and MCP servers.
-- 1,468 tests across 102 files run offline against a fake model server, and CI runs them on Linux and Windows with Python 3.10 and 3.12 on every pull request and push to `main`.
+- 1,476 tests across 102 files run offline against a fake model server, and CI runs them on Linux and Windows with Python 3.10 and 3.12 on every pull request and push to `main`.
 
 ## Quick start
 
@@ -364,7 +364,7 @@ Yes. `sigil -p "..."` prints only the answer and returns an exit code, `--output
 
 ```
 sigil-code/
-├── src/                     # 104 modules
+├── src/                     # 105 modules
 │   ├── main.py              # CLI entry point
 │   ├── agent_runtime.py     # agent loop
 │   ├── agent_tools.py       # built-in tools

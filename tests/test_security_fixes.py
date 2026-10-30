@@ -124,7 +124,9 @@ class BackgroundShellRaceTests(ShellManagerCase):
             closed.append(handle)
             time.sleep(0.3)  # TerminateJobObject + the wait that follows it take a moment
 
-        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
+        # its own session on POSIX, as the manager starts shells: a group signal can only reach this child
+        process = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'],
+                                   start_new_session=(sys.platform != 'win32'))
         self.addCleanup(process.wait)
         self.addCleanup(process.kill)
         handle = object()
@@ -145,7 +147,7 @@ class BackgroundShellRaceTests(ShellManagerCase):
         from src.background_shells import ShellJob
 
         class BrokenProcess:
-            pid = 0
+            pid = 0  # os.getpgid(0) is the caller's own group: safe_killpg refuses pid <= 1
 
             def poll(self):  # noqa: ANN201
                 raise OSError(6, 'The handle is invalid')
@@ -669,6 +671,124 @@ class QueuedAnswerTrustTests(UntrustedCase):
         shown: list[str] = []
         ensure_trust(self.ws, ask=lambda _q: 's', output=shown.append)
         self.assertIn('pre-set answers: .sigil-ask-user.json (1 answers)', '\n'.join(shown))
+
+
+class ProcessGroupSignalTests(unittest.TestCase):
+    """CI after publish: on Linux, stopping a shell whose process was not in its own session (or a fake
+    process with pid 0) ran os.killpg(os.getpgid(pid)), which is OUR group: it killed pytest and the
+    GitHub runner. Every group signal now goes through process_group.safe_killpg. The POSIX branch is
+    simulated with os.killpg / getpgid / getpgrp patched, so nothing is ever really signalled."""
+
+    OWN_GROUP = 4000
+
+    def posix(self, getpgid):  # noqa: ANN001, ANN201
+        import contextlib
+
+        from src import process_group
+
+        sent: list = []
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(process_group, '_posix', return_value=True))
+        stack.enter_context(patch('src.process_group.os.killpg', create=True,
+                                  side_effect=lambda pgid, sig: sent.append(('killpg', pgid))))
+        stack.enter_context(patch('src.process_group.os.kill', side_effect=lambda pid, sig: sent.append(('kill', pid))))
+        stack.enter_context(patch('src.process_group.os.getpgrp', create=True, return_value=self.OWN_GROUP))
+        stack.enter_context(patch('src.process_group.os.getpgid', create=True, side_effect=getpgid))
+        self.addCleanup(stack.close)
+        return sent
+
+    def test_own_pid_own_group_and_system_pids_are_never_signalled(self) -> None:
+        from src.process_group import safe_kill_pid, safe_killpg
+
+        sent = self.posix(lambda pid: self.OWN_GROUP)  # a child without its own session: our group
+        for pid in (os.getpid(), 0, 1, 5555):
+            self.assertFalse(safe_killpg(pid, 15), pid)
+        self.assertFalse(safe_kill_pid(os.getpid(), 15))
+        self.assertFalse(safe_kill_pid(0, 15))
+        self.assertEqual(sent, [])
+
+    def test_a_childs_own_group_is_signalled(self) -> None:
+        from src.process_group import safe_killpg
+
+        sent = self.posix(lambda pid: pid)  # started with start_new_session: pgid == pid
+        self.assertTrue(safe_killpg(5555, 15))
+
+        def gone(pid):  # noqa: ANN001, ANN202 - the leader exited; its group (orphans) keeps the id
+            raise ProcessLookupError(pid)
+
+        sent2 = self.posix(gone)
+        self.assertTrue(safe_killpg(6666, 9))
+        self.assertEqual(sent + sent2, [('killpg', 5555), ('killpg', 6666)])
+
+    def test_kill_process_tree_never_signals_our_group(self) -> None:
+        from types import SimpleNamespace
+
+        from src import background_shells
+
+        sent = self.posix(lambda pid: self.OWN_GROUP)
+        killed: list = []
+
+        class _Process:  # a shell that is not in its own session, as the race test used
+            pid = 5555
+
+            def poll(self):  # noqa: ANN201
+                return None
+
+            def kill(self) -> None:
+                killed.append(self.pid)
+
+            def wait(self, timeout=None):  # noqa: ANN001, ANN201
+                return 0
+
+        with patch.object(background_shells, 'sys', SimpleNamespace(platform='linux')):
+            background_shells.kill_process_tree(_Process())
+        self.assertNotIn(('killpg', self.OWN_GROUP), sent)
+        self.assertEqual(sent, [])
+        self.assertEqual(killed, [5555])  # only that process itself
+
+    def test_stopping_a_record_with_our_own_pid_does_nothing(self) -> None:
+        from src.background_runtime import BackgroundSessionRecord, BackgroundSessionRuntime
+
+        sent = self.posix(lambda pid: self.OWN_GROUP)
+        ran: list = []
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BackgroundSessionRuntime(Path(tmp))
+            bid = 'bg_00000000dead'
+            runtime.save_record(BackgroundSessionRecord(
+                background_id=bid, pid=os.getpid(), prompt='p', workspace_cwd=tmp, model='m', mode='agent',
+                status='running', log_path=str(Path(tmp) / f'{bid}.log'), record_path=str(runtime.record_path(bid)),
+                started_at='2026-01-01T00:00:00+00:00', command=()))
+            with patch('src.background_runtime.subprocess.run', side_effect=lambda *a, **k: ran.append(a)), \
+                    patch.object(BackgroundSessionRuntime, 'refresh_record', side_effect=lambda record: record):
+                runtime.kill(bid)
+        self.assertEqual(ran, [], 'taskkill was run on our own pid')  # Windows branch
+        self.assertEqual(sent, [], 'a signal was sent to our own process or group')  # POSIX branch
+
+
+class ReadOnlyRuleTests(unittest.TestCase):
+    """CI after publish: /read-only wrote `Edit(/abs/path)`, but a single leading `/` means the project
+    root, so on Linux and macOS the file was not protected (Windows drive paths happened to work)."""
+
+    def test_rule_is_absolute_for_a_posix_path(self) -> None:
+        from pathlib import PurePosixPath
+
+        from src.agent_slash_commands import read_only_rule
+        from src.permission_rules import parse_rule, rule_matches
+
+        target = '/srv/ws/spec.md'
+        with tempfile.TemporaryDirectory() as tmp:
+            rule = parse_rule(read_only_rule(PurePosixPath(target)))
+            self.assertTrue(rule_matches(rule, 'edit_file', {'path': target}, cwd=Path(tmp)))
+            old = parse_rule(f'Edit({target})')  # what /read-only used to write
+            self.assertFalse(rule_matches(old, 'edit_file', {'path': target}, cwd=Path(tmp)))
+
+    def test_slash_read_only_uses_the_absolute_form(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp).resolve()
+            (ws / 'spec.md').write_text('x', encoding='utf-8')
+            agent = make_agent(ws, allow_file_write=True)
+            agent.run('/read-only spec.md')
+        self.assertTrue(agent.session_deny_rules[0].raw.startswith('Edit(//'), agent.session_deny_rules[0].raw)
 
 
 class CompactPromptFramingTests(unittest.TestCase):

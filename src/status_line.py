@@ -104,12 +104,11 @@ class StatusLine:
                 from .agent_tools import _kill_process_tree
 
                 if sys.platform != 'win32':
-                    try:
-                        import signal
+                    import signal
 
-                        os.killpg(process.pid, signal.SIGKILL)  # its own session: the whole group
-                    except (OSError, AttributeError) as exc:  # already gone
-                        _log_debug('status line kill: %s', exc)
+                    from .process_group import safe_killpg
+
+                    safe_killpg(process.pid, signal.SIGKILL)  # its own session's group, never ours
                 _kill_process_tree(process)  # the shell and everything it started
                 try:
                     process.communicate(timeout=5)

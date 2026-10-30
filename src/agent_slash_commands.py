@@ -809,6 +809,17 @@ def _handle_focus(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Sla
     return _local_result(input_text, '\n'.join(lines))
 
 
+def read_only_rule(path: Any) -> str:
+    """The Edit deny rule /read-only adds for an absolute path. Rule syntax: `//abs/path` is absolute and
+    a single leading `/` means the project root, so `Edit(/tmp/x/spec.md)` pointed at
+    <project>/tmp/x/spec.md and never protected the file on Linux and macOS (Windows drive paths
+    such as `C:/...` happened to work)."""
+    from pathlib import PurePath
+
+    text = path.as_posix() if isinstance(path, PurePath) else str(path).replace('\\', '/')
+    return f'Edit(//{text.lstrip("/")})'
+
+
 def _handle_read_only(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
     """/read-only <file>: its text goes with the next prompt, and edits to it are refused."""
     from pathlib import Path as _Path
@@ -826,7 +837,7 @@ def _handle_read_only(agent: 'LocalCodingAgent', args: str, input_text: str) -> 
         path = path.resolve()
         if not path.is_file():
             return _local_result(input_text, f'Not a file: {path}')
-        rule = parse_rule(f'Edit({path.as_posix()})')
+        rule = parse_rule(read_only_rule(path))
         if rule is not None and rule.raw not in [r.raw for r in agent.session_deny_rules]:
             agent.session_deny_rules = (*agent.session_deny_rules, rule)
         from .prompt_constants import DEFAULT_MAX_RESULT_SIZE_CHARS

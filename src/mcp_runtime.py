@@ -1033,10 +1033,9 @@ def _end_process_tree(process: 'subprocess.Popen[Any]') -> None:
     else:
         import signal
 
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except (OSError, AttributeError) as exc:  # the group is already gone (normal)
-            _log_close_problem(process, 'SIGTERM', exc)
+        from .process_group import safe_killpg
+
+        safe_killpg(process.pid, signal.SIGTERM)  # its own session's group only, never ours
     if process.poll() is None:
         process.terminate()
     try:
@@ -1045,10 +1044,9 @@ def _end_process_tree(process: 'subprocess.Popen[Any]') -> None:
         if sys.platform != 'win32':
             import signal
 
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except (OSError, AttributeError) as exc:
-                _log_close_problem(process, 'SIGKILL', exc)
+            from .process_group import safe_killpg
+
+            safe_killpg(process.pid, signal.SIGKILL)
         process.kill()
         try:
             process.wait(timeout=1.0)

@@ -2,7 +2,8 @@ name: tests
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'ci/**']
+  workflow_dispatch:
   pull_request:
 
 # least privilege for the workflow token: the jobs only read the repository
@@ -27,7 +28,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: python -m pip install -e ".[dev,yaml]"
-      - run: python -m pytest tests -q -p no:cacheprovider
+      - run: python -m pytest tests -q -rfE -p no:cacheprovider
 
   dependency-audit:
     runs-on: ubuntu-latest

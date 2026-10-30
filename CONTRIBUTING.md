@@ -11,7 +11,7 @@ pip install -e ".[dev]"      # or ".[all,dev]" to pull in the optional extras to
 python -m pytest tests/
 ```
 
-The suite has 1,468 tests in 102 files. It runs fully offline against a fake local model server, so you don't need an API key, a GPU or a network connection. The same tests run in CI (`.github/workflows/tests.yml`).
+The suite has 1,476 tests in 102 files. It runs fully offline against a fake local model server, so you don't need an API key, a GPU or a network connection. The same tests run in CI (`.github/workflows/tests.yml`).
 
 To try your change by hand without reinstalling:
 

@@ -218,6 +218,8 @@ class PosixCleanupTests(unittest.TestCase):
             with patch('src.background_runtime.sys.platform', 'linux'), \
                     patch('src.background_runtime.os.killpg', create=True,
                           side_effect=lambda pid, sig: calls.append((pid, sig))), \
+                    patch('src.background_runtime.os.getpgid', create=True, side_effect=lambda pid: pid), \
+                    patch('src.background_runtime.os.getpgrp', create=True, return_value=1000), \
                     patch('src.background_runtime.os.WNOHANG', 1, create=True), \
                     patch('src.background_runtime.os.waitpid', return_value=(0, 0)), \
                     patch('src.background_runtime.signal.SIGKILL', 9, create=True), \

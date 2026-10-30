@@ -328,7 +328,17 @@ class BackgroundSessionRuntime:
         record = self.load_record(background_id)
         if record.status != 'running':
             return record
-        if sys.platform == 'win32':
+        from .process_group import safe_kill_pid, safe_killpg
+
+        # the pid comes from a record file in the workspace: never our own process, our parent or a
+        # system pid (taskkill /T or a group signal there would end Sigil itself)
+        foreign = record.pid > 4 and record.pid not in (os.getpid(), os.getppid())
+        if not foreign:
+            from .debug_log import get_logger
+
+            get_logger('background').warning('not stopping %s: its pid %s is ours or a system pid',
+                                              record.background_id, record.pid)
+        elif sys.platform == 'win32':
             # os.killpg/os.WNOHANG do not exist on Windows; terminate the whole tree.
             subprocess.run(
                 ['taskkill', '/PID', str(record.pid), '/T', '/F'],
@@ -336,15 +346,9 @@ class BackgroundSessionRuntime:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         else:
-            try:
-                os.killpg(record.pid, signal.SIGTERM)
-            except OSError as _ignored:
-                _log_ignored(_ignored)
-                try:
-                    os.kill(record.pid, signal.SIGTERM)
-                except OSError as _ignored:
-                    _log_ignored(_ignored)
-                    pass
+            # the worker leads its own group (start_new_session): signal that group, or the pid alone
+            if not safe_killpg(record.pid, signal.SIGTERM):
+                safe_kill_pid(record.pid, signal.SIGTERM)
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
             if sys.platform != 'win32':
@@ -362,17 +366,10 @@ class BackgroundSessionRuntime:
                 break
             time.sleep(0.05)
         else:
-            if sys.platform != 'win32':
+            if sys.platform != 'win32' and foreign:
                 # Still alive after SIGTERM: kill the whole process group (its shells and MCP servers).
-                try:
-                    os.killpg(record.pid, signal.SIGKILL)
-                except OSError as _ignored:
-                    _log_ignored(_ignored)
-                    try:
-                        os.kill(record.pid, signal.SIGKILL)
-                    except OSError as _ignored:
-                        _log_ignored(_ignored)
-                        pass
+                if not safe_killpg(record.pid, signal.SIGKILL):
+                    safe_kill_pid(record.pid, signal.SIGKILL)
         process = _DETACHED_PROCESSES.get(record.pid)
         if process is not None:
             try:

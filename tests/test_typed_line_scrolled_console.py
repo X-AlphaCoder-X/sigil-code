@@ -43,6 +43,11 @@ CHILD = textwrap.dedent(r'''
 
     k.SetConsoleMode(h, 0x7)  # VT processing on, as for the agent's colours
     width = info().size.X
+    if len(sys.argv) > 3 and sys.argv[3] == 'no-scrollback':
+        # a buffer no taller than its window (ConPTY: Windows Terminal, VS Code; CI consoles):
+        # every wrap at the last row scrolls the whole buffer
+        w0 = info().win
+        k.SetConsoleScreenBufferSize(h, COORD(width, w0.B - w0.T + 1))
     for _ in range(60):
         echo("filler\n")
     start = info().cur.Y
@@ -69,19 +74,29 @@ CHILD = textwrap.dedent(r'''
 
 @unittest.skipUnless(sys.platform == 'win32', 'needs a real Windows console')
 class ScrolledConsoleTests(unittest.TestCase):
-    def test_deleted_line_is_gone_even_when_view_is_scrolled(self) -> None:
+    def screen(self, *mode: str) -> str:
         with tempfile.TemporaryDirectory() as tmp:
             script = os.path.join(tmp, 'child.py')
             result = os.path.join(tmp, 'screen.txt')
             with open(script, 'w', encoding='utf-8') as fh:
                 fh.write(CHILD)
             subprocess.run(
-                [sys.executable, script, result, ROOT],
+                [sys.executable, script, result, ROOT, *mode],
                 creationflags=subprocess.CREATE_NEW_CONSOLE,
                 timeout=60,
             )
             with open(result, encoding='utf-8') as fh:
-                screen = fh.read()
+                return fh.read()
+
+    def test_deleted_line_is_gone_on_a_console_without_scrollback(self) -> None:
+        """Seen on GitHub's Windows runner (and true of ConPTY): the buffer scrolled under the typed line,
+        its recorded row went stale, and the scrolled view hid the pencil from the row scan."""
+        self.assert_clean(self.screen('no-scrollback'))
+
+    def test_deleted_line_is_gone_even_when_view_is_scrolled(self) -> None:
+        self.assert_clean(self.screen())
+
+    def assert_clean(self, screen: str) -> None:
         self.assertIn('end', screen)
         self.assertNotIn('ok s', screen)
         self.assertNotIn('sss', screen)

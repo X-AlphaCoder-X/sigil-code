@@ -143,6 +143,7 @@ class ConsoleInputReader:
             # the rows the typed line vacates. The typed line is never erased
             # or redrawn — the pencil slides with the buffer while staying on
             # the same on-screen row — so it cannot flicker or bounce.
+            self._refresh_typed_start()
             if self._win_console and self._typed_start_row is not None:
                 if _win_scroll_output_above(self._typed_start_row, done):
                     # The typed line did not move: only the rows above it
@@ -196,6 +197,7 @@ class ConsoleInputReader:
         by a row and the top row of a wrapped line survived deletion (it
         stayed frozen on screen even after the whole line was removed).
         """
+        self._refresh_typed_start()
         if self._win_console:
             if _win_vt_enabled() and _win_rows_visible(self._typed_start_row):
                 cur = _win_cursor_row()
@@ -209,6 +211,21 @@ class ConsoleInputReader:
         rows_above = self._typed_cols() // self._width()  # cursor parked by _park_cursor()
         up = '\033[%dA' % rows_above if rows_above else ''
         return '\r' + up + '\033[J'
+
+    def _refresh_typed_start(self) -> None:
+        """Look the typed line's start row up again just before it is used (Windows only).
+
+        A recorded absolute row goes stale whenever the whole buffer scrolls: typing past the
+        last row of a console whose buffer is no taller than its window (Windows Terminal and VS
+        Code via ConPTY, CI consoles) wraps the line and scrolls everything up one row, so the
+        clear started one row too low and the top row of the deleted line stayed on screen.
+        The pencil glyph's current row (scanned bottom-up) is always right."""
+        if self._win_console and self._typed_start_row is not None:  # a typed line is on screen
+            # scan the buffer rows the typed line can span above the cursor, not only the visible
+            # window: a scrolled view can hide the line's top row
+            row = _win_pencil_row_near_cursor(self._typed_cols() // self._width() + 2)
+            if row is not None:
+                self._typed_start_row = row
 
     def _record_typed_start(self) -> None:
         """Remember the buffer row where the typed line begins (Windows only).
@@ -544,6 +561,56 @@ def _win_pencil_row() -> int | None:
             for c in range(cols):
                 if buf[r * cols + c].Char == '\u270e':
                     return info.window.Top + r
+        return None
+    except Exception as _ignored:
+        _log_ignored(_ignored)
+        return None
+
+
+def _win_pencil_row_near_cursor(rows: int) -> int | None:
+    """Buffer row of the pencil glyph in the `rows` buffer rows above (and on) the cursor row, or None.
+
+    Unlike _win_pencil_row this does not depend on the visible window, so it still finds the typed
+    line when the user has scrolled the view, or when the whole buffer scrolled under it (a console
+    whose buffer is no taller than its window, as with ConPTY)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _COORD(ctypes.Structure):
+            _fields_ = [('X', wintypes.SHORT), ('Y', wintypes.SHORT)]
+
+        class _SMALL_RECT(ctypes.Structure):
+            _fields_ = [('Left', wintypes.SHORT), ('Top', wintypes.SHORT),
+                        ('Right', wintypes.SHORT), ('Bottom', wintypes.SHORT)]
+
+        class _CHAR_INFO(ctypes.Structure):
+            _fields_ = [('Char', wintypes.WCHAR), ('Attributes', wintypes.WORD)]
+
+        class _CSBI(ctypes.Structure):
+            _fields_ = [('size', _COORD), ('cursor', _COORD), ('attr', wintypes.WORD),
+                        ('window', _SMALL_RECT), ('max_size', _COORD)]
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        info = _CSBI()
+        if not kernel32.GetConsoleScreenBufferInfo(handle, ctypes.byref(info)):
+            return None
+        cols = info.size.X
+        bottom = info.cursor.Y
+        top = max(0, bottom - max(rows, 1))
+        count = bottom - top + 1
+        if cols <= 0 or count <= 0:
+            return None
+        buf = (_CHAR_INFO * (cols * count))()
+        rect = _SMALL_RECT(0, top, cols - 1, bottom)
+        if not kernel32.ReadConsoleOutputW(
+                handle, buf, _COORD(cols, count), _COORD(0, 0), ctypes.byref(rect)):
+            return None
+        for r in range(count - 1, -1, -1):  # bottom-up: the live line
+            for c in range(cols):
+                if buf[r * cols + c].Char == '\u270e':
+                    return top + r
         return None
     except Exception as _ignored:
         _log_ignored(_ignored)
