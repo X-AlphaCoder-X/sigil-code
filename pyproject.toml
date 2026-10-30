@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sigilcode"
+version = "1.0.0"
+description = "Sigil Code: an open-source, fully customizable Python coding agent. Works with any OpenAI-compatible model."
+readme = "README.md"
+license = { text = "AGPL-3.0-or-later" }
+requires-python = ">=3.10"
+authors = [
+  { name = "Sigil Code Contributors" }
+]
+keywords = [
+  "agent",
+  "cli",
+  "coding-agent",
+  "local-model",
+  "python",
+  "qwen",
+  "vllm",
+  "ai-agent",
+  "openai-compatible"
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Software Development",
+  "Topic :: Software Development :: Build Tools",
+]
+dependencies = [
+  "prompt_toolkit>=3.0",
+  "rich>=13.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "tomli>=2; python_version < '3.11'"]
+yaml = ["PyYAML>=6"]
+ast = ["tree-sitter>=0.22", "tree-sitter-python", "tree-sitter-cpp"]
+tokenizers = ["tiktoken"]
+pdf = ["pypdf>=4"]
+all = ["PyYAML>=6", "tree-sitter>=0.22", "tree-sitter-python", "tree-sitter-cpp", "tiktoken", "pypdf>=4"]
+
+[project.urls]
+Homepage = "https://github.com/X-AlphaCoder-X/sigil-code"
+Repository = "https://github.com/X-AlphaCoder-X/sigil-code"
+
+[project.scripts]
+sigil = "src.main:main"
+sigilcode = "src.main:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+

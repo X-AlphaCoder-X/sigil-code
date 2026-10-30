@@ -1,0 +1,55 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+archive/
+.omx/
+.sigil-agents/
+
+# Local agent/runtime artifacts
+.claude/
+.claude.json
+.port_sessions/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Local benchmark outputs
+benchmark_artifacts/
+jobs/
+output_terminal/
+tb2*.json
+humaneval_results.json
+
+
+test_cases
+e-commerce
+benchmarks/data/*.jsonl
+benchmarks/data/manifest.json
+
+# Local secrets / personal config (examples live in examples/)
+.sigil-*.json
+!examples/.sigil-*.json
+*.rtf
+custom_tools/
+src/custom_tools/
+src/.context7_usage.json
+src/.mcp_rate_limits.json
+
+# Sigil local settings (per user, not shared)
+.sigil/settings.local.json
+
+# Internal working notes and personal setup scripts: never published
+IMPLEMENTATION.md
+PARITY_CHECKLIST.md
+NEW_FEATURES.md
+install_docker.sh

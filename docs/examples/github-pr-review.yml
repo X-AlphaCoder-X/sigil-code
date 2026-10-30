@@ -1,0 +1,42 @@
+# Example GitHub Actions workflow: Sigil Code reviews each pull request in print mode.
+# Copy it to .github/workflows/sigil-review.yml in your repository and set the secrets.
+# It is an example only; nothing in this repository runs it.
+name: sigil-review
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Sigil Code
+        run: pip install "git+https://github.com/X-AlphaCoder-X/sigil-code.git"
+
+      - name: Review the diff
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+        run: |
+          git diff origin/${{ github.base_ref }}...HEAD > pr.diff
+          cat pr.diff | sigil -p "Review this pull request diff. List bugs, risky changes and missing tests, with file and line. Be brief." \
+            --no-session-persistence --max-turns 8 > review.md
+
+      - name: Post the review
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr comment ${{ github.event.pull_request.number }} --body-file review.md
