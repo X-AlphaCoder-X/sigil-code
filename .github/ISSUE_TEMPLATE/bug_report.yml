@@ -1,0 +1,72 @@
+name: Bug report
+description: Something in Sigil Code doesn't work the way it should.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Please search the open issues first.
+        Security problems go through a private report instead (see SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did Sigil do, and what did you expect it to do?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The smallest prompt, command or setup that shows the problem.
+      placeholder: |
+        1. Run `sigil` in a folder with ...
+        2. Ask "..."
+        3. See ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sigil version
+      description: Output of `sigil --version`.
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12"
+  - type: input
+    id: model
+    attributes:
+      label: Model and provider
+      description: For example "qwen3-coder on Ollama" or "a model on OpenRouter".
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Relevant lines from ~/.sigil/logs (run with --debug for request and response bodies).
+        Remove API keys and anything private first.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before you submit
+      options:
+        - label: I searched the open issues and this isn't a duplicate.
+          required: true
+        - label: I removed API keys, tokens and private data from everything above.
+          required: true

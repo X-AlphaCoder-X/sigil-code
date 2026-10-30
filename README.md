@@ -407,7 +407,7 @@ pip install -e ".[dev]"
 python -m pytest tests/
 ```
 
-The suite doesn't need a network connection or a GPU, because it runs against a fake local model server. See [CONTRIBUTING.md](CONTRIBUTING.md) for the layout, how to add a tool or slash command, and PR guidelines.
+The suite doesn't need a network connection or a GPU, because it runs against a fake local model server. See [CONTRIBUTING.md](CONTRIBUTING.md) for how to report bugs, the layout, how to add a tool or slash command, and PR guidelines. Everyone taking part follows the [Code of Conduct](CODE_OF_CONDUCT.md).
 
 ## Roadmap
 
