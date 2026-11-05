@@ -4,6 +4,7 @@ import http.client
 import json
 import os
 import queue
+import re
 import threading
 from typing import Any, Iterator
 from urllib import error, request
@@ -31,6 +32,8 @@ class OpenAICompatError(RuntimeError):
 
 _EXTRA_HEADERS_CACHE: dict[str, tuple[tuple, Any]] = {}
 _EXTRA_HEADERS_LOCK = __import__('threading').Lock()  # why: parallel subagents send requests at once
+# an error text about Google's cached content (CachedContent, cached_content, cachedContents/...)
+_CACHED_CONTENT_RE = re.compile(r'cached[ _]?contents?', re.IGNORECASE)
 
 
 def _configured_extra_headers() -> Any:
@@ -226,26 +229,93 @@ def _parse_usage(payload: Any) -> UsageStats:
     completion_details = payload.get('completion_tokens_details')
     if not isinstance(completion_details, dict):
         completion_details = {}
+    input_tokens = (
+        _optional_int(payload.get('input_tokens'))
+        or _optional_int(payload.get('prompt_tokens'))
+        or _optional_int(payload.get('prompt_eval_count'))
+    )
+    details = payload.get('prompt_tokens_details') or payload.get('input_tokens_details')
+    if not isinstance(details, dict):
+        details = {}
+    split = payload.get('cache_creation') if isinstance(payload.get('cache_creation'), dict) else {}
+    cache_write = _optional_int(payload.get('cache_creation_input_tokens'))
+    cache_read = _optional_int(payload.get('cache_read_input_tokens'))
+    anthropic_style = bool(cache_write or cache_read) and not _optional_int(payload.get('prompt_tokens'))
+    if not anthropic_style:
+        # Why: OpenAI-style APIs count cached tokens inside the prompt total; Anthropic-style
+        # fields count them apart. Split them out so both read the same way.
+        cache_read = (cache_read
+                      or _optional_int(details.get('cached_tokens'))
+                      or _optional_int(payload.get('cached_tokens'))              # Together (top level)
+                      or _optional_int(payload.get('prompt_cache_hit_tokens')))   # DeepSeek
+        cache_write = (cache_write
+                       or _optional_int(details.get('cache_write_tokens'))           # OpenAI 5.6+, OpenRouter
+                       or _optional_int(details.get('cache_creation_input_tokens'))   # DashScope
+                       or _optional_int(details.get('cache_creation_tokens')))         # SambaNova
+        cache_read = max(0, min(cache_read, input_tokens))
+        cache_write = max(0, min(cache_write, input_tokens - cache_read))
+        input_tokens -= cache_read + cache_write
+    written_1h = min(_optional_int(split.get('ephemeral_1h_input_tokens')), cache_write)
     return UsageStats(
-        input_tokens=(
-            _optional_int(payload.get('input_tokens'))
-            or _optional_int(payload.get('prompt_tokens'))
-            or _optional_int(payload.get('prompt_eval_count'))
-        ),
+        input_tokens=input_tokens,
         output_tokens=(
             _optional_int(payload.get('output_tokens'))
             or _optional_int(payload.get('completion_tokens'))
             or _optional_int(payload.get('eval_count'))
         ),
-        cache_creation_input_tokens=_optional_int(
-            payload.get('cache_creation_input_tokens')
-        ),
-        cache_read_input_tokens=_optional_int(payload.get('cache_read_input_tokens')),
+        cache_creation_input_tokens=cache_write,
+        cache_read_input_tokens=cache_read,
         reasoning_tokens=(
             _optional_int(payload.get('reasoning_tokens'))
             or _optional_int(completion_details.get('reasoning_tokens'))
         ),
+        cache_creation_1h_input_tokens=max(0, written_1h),
     )
+
+
+_CACHED_HEADER_KEY = '__sigil_cached_prompt_tokens'
+
+
+def _header_cached_tokens(headers: Any) -> int | None:
+    """Fireworks puts the cached prompt tokens of a non-streamed reply in a response header
+    (docs.fireworks.ai/serverless/overview: fireworks-cached-prompt-tokens)."""
+    for name, value in (headers or {}).items():
+        if str(name).lower() == 'fireworks-cached-prompt-tokens':
+            count = _optional_int(value)
+            return count if count > 0 else None
+    return None
+
+
+def _perf_cached_tokens(payload: Any) -> int | None:
+    """A streamed Fireworks reply has no per-request headers; the metrics come in the final chunk's
+    perf_metrics (docs.fireworks.ai/api-reference/post-chatcompletions). The key spelling inside it
+    is not documented, so the header name and its snake_case form are both read."""
+    metrics = payload.get('perf_metrics') if isinstance(payload, dict) else None
+    if not isinstance(metrics, dict):
+        return None
+    for key, value in metrics.items():
+        if str(key).lower().replace('_', '-') in ('fireworks-cached-prompt-tokens', 'cached-prompt-tokens'):
+            count = _optional_int(value)
+            return count if count > 0 else None
+    return None
+
+
+def _with_cached_count(usage: UsageStats, cached: int | None) -> UsageStats:
+    """Move a cached count reported outside the usage object into cache reads (only when the usage
+    object reports none, so nothing is counted twice)."""
+    if not cached or usage.cache_read_input_tokens or usage.cache_creation_input_tokens:
+        return usage
+    moved = min(int(cached), usage.input_tokens)
+    from dataclasses import replace as _replace
+
+    return _replace(usage, input_tokens=usage.input_tokens - moved, cache_read_input_tokens=moved)
+
+
+def _with_cache_breakpoints(messages: list[Any], cache_control: dict[str, str]) -> list[Any]:
+    """Kept for callers of the old name: see prompt_cache.with_breakpoints."""
+    from .prompt_cache import with_breakpoints
+
+    return with_breakpoints(messages, cache_control)
 
 
 def _normalize_tool_schemas(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -351,6 +421,36 @@ class OpenAICompatClient:
                     f'Refusing to send API key over unencrypted HTTP to {config.base_url}. '
                     'Use HTTPS for non-localhost endpoints, or set allow_insecure_http=True to override.'
                 )
+        # Reasoning sent back with later requests (thinking_replay.py): what the last reply needs
+        # replayed, and what this endpoint has asked for or refused.
+        self._last_replay: dict[str, Any] | None = None
+        self._replay_echo_learned = False
+        self._replay_fill = False
+        self._replay_dummy_signatures = False
+        self._replay_refused = False
+
+    def pop_replay(self) -> dict[str, Any] | None:
+        """reasoning_content and tool-call extra_content of the last reply (sent back with later
+        requests to this endpoint); cleared once read."""
+        replay, self._last_replay = self._last_replay, None
+        return replay
+
+    def _learn_replay(self, exc: Exception) -> bool:
+        """A 400/422 that asks for reasoning to be sent back, or refuses it: change what is sent to
+        this endpoint for the rest of the session and say whether to send the request again."""
+        from . import thinking_replay
+
+        kind = thinking_replay.classify_compat_error(str(exc))
+        if kind == 'reasoning' and not (self._replay_fill or self._replay_refused):
+            self._replay_echo_learned = self._replay_fill = True
+        elif kind == 'signature' and not (self._replay_dummy_signatures or self._replay_refused):
+            self._replay_dummy_signatures = True
+        elif kind == 'reject' and not self._replay_refused:
+            self._replay_refused = True
+        else:
+            return False
+        thinking_replay.note(kind, self.config.model)
+        return True
 
     def complete(
         self,
@@ -360,19 +460,21 @@ class OpenAICompatClient:
         output_schema: OutputSchemaConfig | None = None,
     ) -> AssistantTurn:
         self._rate_limiter.acquire()
-        request_payload = self._build_payload(
-            messages=messages,
-            tools=tools,
-            stream=False,
-            output_schema=output_schema,
-        )
-        _log_body('request', request_payload)
-        try:
-            payload = self._request_json(request_payload)
-        except OpenAICompatError as exc:
-            if not self._retry_without_effort_none(request_payload, exc):
-                raise
-            payload = self._request_json(request_payload)
+        self._last_replay = None
+        for attempt in range(3):  # bounded: each retry changes what is sent (_learn_replay)
+            request_payload = self._build_payload(
+                messages=messages,
+                tools=tools,
+                stream=False,
+                output_schema=output_schema,
+            )
+            _log_body('request', request_payload)
+            try:
+                payload = self._post_with_fallbacks(request_payload)
+                break
+            except OpenAICompatError as exc:
+                if attempt == 2 or not self._learn_replay(exc):
+                    raise
         _log_body('response', payload)
         choices = payload.get('choices')
         if not isinstance(choices, list) or not choices:
@@ -392,8 +494,14 @@ class OpenAICompatClient:
         if finish_reason is not None and not isinstance(finish_reason, str):
             finish_reason = str(finish_reason)
 
-        usage = _parse_usage(payload.get('usage'))
+        usage = _with_cached_count(_parse_usage(payload.get('usage')), payload.pop(_CACHED_HEADER_KEY, None))
         self._rate_limiter.record_usage(usage.total_tokens)
+        from . import explicit_cache
+
+        explicit_cache.observe(self.config.base_url, self.config.model, usage)
+        from .thinking_replay import capture
+
+        self._last_replay = capture(message, self.config.base_url, self.config.model)
         return AssistantTurn(
             content=content,
             tool_calls=tuple(tool_calls),
@@ -410,18 +518,147 @@ class OpenAICompatClient:
         output_schema: OutputSchemaConfig | None = None,
     ) -> Iterator[StreamEvent]:
         self._rate_limiter.acquire()
-        payload = self._build_payload(
-            messages=messages,
-            tools=tools,
-            stream=True,
-            output_schema=output_schema,
-        )
+        self._last_replay = None
+        for attempt in range(3):  # bounded: each retry changes what is sent (_learn_replay)
+            payload = self._build_payload(
+                messages=messages,
+                tools=tools,
+                stream=True,
+                output_schema=output_schema,
+            )
+            started = False
+            try:
+                for event in self._stream_with_fallbacks(payload):
+                    started = True
+                    yield event
+                return
+            except OpenAICompatError as exc:
+                if started or attempt == 2 or not self._learn_replay(exc):
+                    raise
+
+    def _bearer(self) -> str:
+        """The bearer key: on Vertex a fresh access token when SIGIL_GOOGLE_TOKEN_COMMAND is set
+        (google_auth), else the configured key."""
+        from .prompt_cache import provider_of
+
+        if provider_of(self.config.base_url) == 'vertex':
+            from .google_auth import access_token
+
+            return access_token(str(self.config.api_key))
+        return str(self.config.api_key)
+
+    @staticmethod
+    def _explicit_cache_failed(exc: Exception) -> bool:
+        """An error to a request that named an explicit cache that is about that cache: send it again
+        without the cache. Google answers a cache that expired, was deleted or belongs to another
+        project with 403 or 404 ("CachedContent not found (or permission denied)"), and a 400/422 that
+        names the cached content. A rate limit (429), an auth error (401) or a 400 about something else
+        (a context that is too long) is not about the cache: it keeps the cache and goes to the normal
+        retry. Why: every 4xx used to delete a valid cache and resend at once, without backoff."""
+        text = str(exc)
+        match = re.match(r'HTTP (\d{3})\b', text)
+        if match is None:
+            return False
+        status = int(match.group(1))
+        if status in (403, 404):
+            return True
+        return status in (400, 422) and _CACHED_CONTENT_RE.search(text) is not None
+
+    def _post_with_fallbacks(self, payload: dict[str, Any]) -> dict[str, Any]:
+        from . import explicit_cache
+
+        full = payload.pop(explicit_cache.FULL_KEY, None)
+        if full is None:
+            return self._post_plain(payload)
         try:
-            yield from self._stream_payload(payload)
+            return self._post_plain(payload)
         except OpenAICompatError as exc:
-            if not self._retry_without_effort_none(payload, exc):
+            if not self._explicit_cache_failed(exc):
                 raise
-            yield from self._stream_payload(payload)
+            explicit_cache.request_failed(payload, exc)
+            return self._post_plain(full)
+
+    def _post_plain(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """POST once; on a 400 for reasoning_effort "none" retry with "low"; on a 400/422 about the
+        cache fields we sent retry once without them (remembered for the endpoint when that works)."""
+        try:
+            return self._request_json(payload)
+        except OpenAICompatError as exc:
+            if self._retry_without_effort_none(payload, exc):
+                return self._post_plain(payload)  # bounded: effort is now "low"
+            stripped = self._without_cache_fields(payload, exc)
+            if stripped is None:
+                raise
+            result = self._request_json(stripped)
+            self._remember_cache_rejection(exc)
+            return result
+
+    def _stream_with_fallbacks(self, payload: dict[str, Any]) -> Iterator[StreamEvent]:
+        from . import explicit_cache
+
+        full = payload.pop(explicit_cache.FULL_KEY, None)
+        if full is None:
+            yield from self._stream_plain(payload)
+            return
+        started = False
+        try:
+            for event in self._stream_plain(payload):
+                started = True
+                yield event
+        except OpenAICompatError as exc:
+            if started or not self._explicit_cache_failed(exc):
+                raise
+            explicit_cache.request_failed(payload, exc)
+            yield from self._stream_plain(full)
+
+    def _stream_plain(self, payload: dict[str, Any]) -> Iterator[StreamEvent]:
+        started = False
+        try:
+            for event in self._stream_payload(payload):
+                started = True
+                yield event
+        except OpenAICompatError as exc:
+            if started:
+                raise
+            if self._retry_without_effort_none(payload, exc):
+                yield from self._stream_plain(payload)
+                return
+            stripped = self._without_cache_fields(payload, exc)
+            if stripped is None:
+                raise
+            remembered = False
+            for event in self._stream_payload(stripped):
+                if not remembered:
+                    remembered = True
+                    self._remember_cache_rejection(exc)
+                yield event
+            if not remembered:
+                self._remember_cache_rejection(exc)
+
+    def _without_cache_fields(self, payload: dict[str, Any], exc: Exception) -> dict[str, Any] | None:
+        """The payload without cache fields when the 400/422 is about them, else None (logged either way)."""
+        from . import prompt_cache
+
+        if not prompt_cache.should_retry_without_cache(exc, payload, self.config.model):
+            return None
+        return prompt_cache.strip_cache_fields(payload)
+
+    def _remember_cache_rejection(self, exc: Exception) -> None:
+        from . import prompt_cache
+
+        prompt_cache.remember_rejected(self.config.base_url, self.config.model, str(exc))
+
+    def _cache_headers(self, payload: dict[str, Any]) -> dict[str, str]:
+        """Session headers that keep a conversation on the server holding its cache (xAI, Fireworks,
+        OpenRouter). Headers are never rejected as unknown, so they stay on a retry."""
+        from . import prompt_cache
+
+        plan = prompt_cache.plan_for(self.config.base_url, self.config.model)
+        headers: dict[str, str] = {}
+        if plan.active and plan.key_headers:
+            key = prompt_cache.cache_key(self.config.model, payload.get('messages') or [])
+            headers = {name: key for name in plan.key_headers}
+        return headers
 
     def _stream_payload(self, payload: dict[str, Any]) -> Iterator[StreamEvent]:
         _log_body('request (stream)', payload)
@@ -429,8 +666,9 @@ class OpenAICompatClient:
             _join_url(self.config.base_url, '/chat/completions'),
             data=json.dumps(payload).encode('utf-8'),
             headers={
-                'Authorization': f'Bearer {self.config.api_key}',
+                'Authorization': f'Bearer {self._bearer()}',
                 'Content-Type': 'application/json',
+                **self._cache_headers(payload),
                 **extra_headers(),
             },
             method='POST',
@@ -443,10 +681,12 @@ class OpenAICompatClient:
                 # [BLOCKING] Handshake
                 with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
                     q.put(StreamEvent(type='message_start'))
+                    state: dict[str, Any] = {}  # per stream: a cached count seen in perf_metrics
                     # [BLOCKING] Payload iteration (line-by-line reading)
                     for event_payload in self._iter_sse_payloads(response):
-                        for event in self._parse_stream_payload(event_payload):
+                        for event in self._parse_stream_payload(event_payload, state):
                             q.put(event)
+                    self._last_replay = self._replay_from_stream(state)
             except BaseException as e:  # noqa: BLE001 - re-raised in the calling thread
                 q.put(e)
             finally:
@@ -487,8 +727,9 @@ class OpenAICompatClient:
             _join_url(self.config.base_url, '/chat/completions'),
             data=body,
             headers={
-                'Authorization': f'Bearer {self.config.api_key}',
+                'Authorization': f'Bearer {self._bearer()}',
                 'Content-Type': 'application/json',
+                **self._cache_headers(payload),
                 **extra_headers(),
             },
             method='POST',
@@ -499,7 +740,7 @@ class OpenAICompatClient:
         def _worker():
             try:
                 with request.urlopen(req, timeout=self.config.timeout_seconds) as response:
-                    q.put(response.read())
+                    q.put((response.read(), dict(getattr(response, 'headers', None) or {})))
             except BaseException as e:  # noqa: BLE001 - re-raised in the calling thread
                 q.put(e)
 
@@ -533,12 +774,16 @@ class OpenAICompatClient:
                 raise OpenAICompatError(f'Backend closed the connection without a response ({type(raw).__name__}: {raw}). This is usually a transient backend issue; retrying.') from raw
             raise raw
 
+        raw, response_headers = raw if isinstance(raw, tuple) else (raw, {})
         try:
             payload = json.loads(raw.decode('utf-8'))
         except json.JSONDecodeError as exc:
             raise OpenAICompatError('Local model backend returned invalid JSON') from exc
         if not isinstance(payload, dict):
             raise OpenAICompatError('Local model backend returned malformed JSON payload')
+        cached = _header_cached_tokens(response_headers)
+        if cached is not None:
+            payload[_CACHED_HEADER_KEY] = cached
         return payload
 
     def _build_payload(
@@ -549,11 +794,20 @@ class OpenAICompatClient:
         stream: bool,
         output_schema: OutputSchemaConfig | None,
     ) -> dict[str, Any]:
+        from . import prompt_cache as _prompt_cache
+        from . import thinking_replay
+
+        provider = _prompt_cache.cache_provider(self.config.base_url, self.config.model)
         payload: dict[str, Any] = {
             'model': self.config.model,
-            # anthropic_content (native Messages API reply blocks) is internal: never sent here
-            'messages': [{k: v for k, v in m.items() if k != 'anthropic_content'}
-                         if isinstance(m, dict) and 'anthropic_content' in m else m for m in messages],
+            # anthropic_content and provider_replay are internal and never sent as such; a reply's
+            # reasoning_content / tool-call extra_content go back to the endpoint that wrote them
+            'messages': thinking_replay.prepare(
+                messages, base_url=self.config.base_url, model=self.config.model, provider=provider,
+                echo=not self._replay_refused and (
+                    self._replay_echo_learned or thinking_replay.echoes_reasoning(provider, self.config.model)),
+                fill=self._replay_fill, dummy_signatures=self._replay_dummy_signatures,
+                send_fields=not self._replay_refused),
             'stream': stream,
         }
         # Sent only when set: Claude 4.7+ returns HTTP 400 for values below 1.
@@ -595,7 +849,16 @@ class OpenAICompatClient:
         )
         if getattr(self, '_effort_none_rejected', False) and payload.get('reasoning_effort') == 'none':
             payload['reasoning_effort'] = 'low'
-        return _apply_excluded_params(payload)
+        from . import prompt_cache
+
+        plan = prompt_cache.plan_for(self.config.base_url, self.config.model)
+        if plan.markers:
+            payload['messages'] = prompt_cache.with_breakpoints(payload['messages'], plan.marker())
+        prompt_cache.apply_hints(plan, payload, {})  # headers: _cache_headers, per request
+        from . import explicit_cache
+
+        # Gemini / Vertex: the stable prefix from a cachedContents resource when the price rule says so
+        return explicit_cache.apply(self.config, _apply_excluded_params(payload), self._bearer)
 
     def _retry_without_effort_none(self, payload: dict[str, Any], exc: Exception) -> bool:
         """A 400 for reasoning_effort 'none' (models before gpt-5.1, some newer ones): use 'low' from now on."""
@@ -635,6 +898,32 @@ class OpenAICompatClient:
             arguments = _tool_arguments_or_marker(function_call.get('arguments'))
             tool_calls.append(ToolCall(id='call_0', name=name, arguments=arguments))
         return tool_calls
+
+    @staticmethod
+    def _collect_replay(delta: dict[str, Any], state: dict[str, Any]) -> None:
+        """Streamed reasoning_content and each tool call's id and extra_content, by call index."""
+        reasoning = delta.get('reasoning_content')
+        if isinstance(reasoning, str):
+            state.setdefault('reasoning', []).append(reasoning)
+        for call in delta.get('tool_calls') or []:
+            if not isinstance(call, dict):
+                continue
+            index = call.get('index') if isinstance(call.get('index'), int) else 0
+            if isinstance(call.get('id'), str) and call['id']:
+                state.setdefault('call_ids', {})[index] = call['id']
+            if isinstance(call.get('extra_content'), dict):
+                state.setdefault('call_extras', {})[index] = call['extra_content']
+
+    def _replay_from_stream(self, state: dict[str, Any]) -> dict[str, Any] | None:
+        from .thinking_replay import capture
+
+        ids = state.get('call_ids') or {}
+        extras = state.get('call_extras') or {}
+        message: dict[str, Any] = {'tool_calls': [
+            {'id': ids.get(index) or f'call_{index}', 'extra_content': extra} for index, extra in extras.items()]}
+        if 'reasoning' in state:
+            message['reasoning_content'] = ''.join(state['reasoning'])
+        return capture(message, self.config.base_url, self.config.model)
 
     def _iter_sse_payloads(self, response: Any) -> Iterator[dict[str, Any]]:
         buffer: list[str] = []
@@ -683,10 +972,18 @@ class OpenAICompatClient:
     def _parse_stream_payload(
         self,
         payload: dict[str, Any],
+        state: dict[str, Any] | None = None,
     ) -> Iterator[StreamEvent]:
-        usage = _parse_usage(payload.get('usage'))
+        state = state if state is not None else {}
+        cached = _perf_cached_tokens(payload)
+        if cached is not None:
+            state['cached'] = cached
+        usage = _with_cached_count(_parse_usage(payload.get('usage')), state.get('cached'))
         if usage.total_tokens:
             self._rate_limiter.record_usage(usage.total_tokens)
+            from . import explicit_cache
+
+            explicit_cache.observe(self.config.base_url, self.config.model, usage)
             yield StreamEvent(
                 type='usage',
                 usage=usage,
@@ -703,6 +1000,7 @@ class OpenAICompatClient:
             delta = choice.get('delta')
             if not isinstance(delta, dict):
                 delta = {}
+            self._collect_replay(delta, state)
             content = delta.get('content')
             if isinstance(content, str) and content:
                 yield StreamEvent(

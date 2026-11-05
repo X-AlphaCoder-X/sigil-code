@@ -244,7 +244,7 @@ def _get_user_context_cached(
             else 'Workspace trust mode: untrusted'
         )
     mcp_runtime = MCPRuntime.from_workspace(Path(cwd), additional_working_directories)
-    if mcp_runtime.resources or mcp_runtime.servers:
+    if mcp_runtime.resources or mcp_runtime.servers or mcp_runtime.skipped_untrusted:
         context['mcpRuntime'] = mcp_runtime.render_summary()
     remote_runtime = RemoteRuntime.from_workspace(Path(cwd), additional_working_directories)
     if remote_runtime.has_remote_config():
@@ -661,7 +661,7 @@ def _detect_default_branch(cwd: Path) -> str | None:
                 ['git', 'show-ref', '--verify', f'refs/heads/{candidate}'],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=2.0,
                 check=False,
             )
@@ -684,7 +684,7 @@ def _is_git_repo(cwd: Path) -> bool:
             ['git', 'rev-parse', '--is-inside-work-tree'],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=2.0,
             check=False,
         )
@@ -710,7 +710,7 @@ def _run_command(command: list[str], cwd: Path) -> str | None:
             command,
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=2.0,
             check=False,
         )
@@ -731,3 +731,27 @@ def _get_os_version() -> str:
     if system and release:
         return f'{system} {release}'
     return platform.platform()
+
+
+def refresh_mcp_context(user_context: dict, cwd: str | Path,
+                        additional_working_directories: tuple[str, ...] = ()) -> dict | None:
+    """A copy of a saved session's context with the MCP summary rebuilt for the folder as it is now,
+    or None when the MCP configuration could not be read (logged as a warning).
+
+    Why: a resumed session used to keep the summary from when it started, so it could list servers as
+    configured (or connected) after folder trust had left them out, or the other way round. A failed
+    read returns None, not an empty summary, so the caller never reports "no servers" by mistake."""
+    refreshed = dict(user_context)
+    try:
+        runtime = MCPRuntime.from_workspace(Path(cwd), tuple(str(p) for p in additional_working_directories))
+    except Exception as exc:
+        from .debug_log import get_logger, sanitize_log
+
+        get_logger('mcp').warning('MCP status not refreshed for %s: %s: %s', cwd, type(exc).__name__,
+                                  sanitize_log(str(exc), 300))
+        return None
+    if runtime.resources or runtime.servers or runtime.skipped_untrusted:
+        refreshed['mcpRuntime'] = runtime.render_summary()
+    else:
+        refreshed.pop('mcpRuntime', None)
+    return refreshed

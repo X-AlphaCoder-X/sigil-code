@@ -74,8 +74,16 @@ def profile_config(config: Any, profile: dict[str, Any]) -> Any:
         key_env = None
     api_key = (os.environ.get(str(key_env)) if key_env else None) or profile.get('api_key')
     if api_key:
-        return replace(config, base_url=str(base_url), model=str(model), api_key=str(api_key))
+        return replace(config, base_url=str(base_url), model=str(model), api_key=str(api_key),
+                       pricing=_pricing_for(config, str(model), str(base_url), str(api_key)))
     return config_for_endpoint(config, str(model), str(base_url))
+
+
+def _pricing_for(config: Any, model: str, base_url: str, api_key: str = '') -> Any:
+    """config's prices derived again for model at base_url (prompt_cache.reprice; flag prices kept)."""
+    from .prompt_cache import reprice
+
+    return reprice(config.pricing, str(config.base_url), str(config.model), base_url, model, api_key=api_key)
 
 
 _NOTIFIED_HOSTS: set[str] = set()
@@ -118,7 +126,8 @@ def config_for_endpoint(config: Any, model: str, base_url: str) -> Any:
     profiles). The main API key goes only to its own server (same scheme, host and port).
     Why: `model@https://other.host/v1` used to send the main key to that other host. Another
     host gets its own key from SIGIL_API_KEY_<HOST>, otherwise the placeholder 'local-token'
-    (enough for local servers), and a one-time notice says so."""
+    (enough for local servers), and a one-time notice says so. The prices are derived again for
+    the new model and endpoint (prompt_cache.reprice; flag prices kept)."""
     model = model or config.model
     base_url = base_url or config.base_url
     if _host(str(base_url)) == _host(str(config.base_url)):
@@ -134,7 +143,8 @@ def config_for_endpoint(config: Any, model: str, base_url: str) -> Any:
 
                 print(f'{_host(str(base_url))}: the main API key is not sent to another server; set '
                       f'{env_name} if it needs a key.', file=sys.stderr)
-    return replace(config, base_url=str(base_url), model=str(model), api_key=str(api_key), fallback_models=())
+    return replace(config, base_url=str(base_url), model=str(model), api_key=str(api_key), fallback_models=(),
+                   pricing=_pricing_for(config, str(model), str(base_url), str(api_key)))
 
 
 def _host(url: str) -> str:

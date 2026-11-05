@@ -5,6 +5,7 @@ import collections
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import time
@@ -240,10 +241,18 @@ class MCPServerProfile:
     headers: dict[str, str] = field(default_factory=dict)
 
 
+def _plain_label(name: str, limit: int = 48) -> str:
+    """A server name from a project file as a short plain label: letters, digits and . _ - @ / : only."""
+    label = re.sub(r'[^\w.@/:-]+', '_', str(name)).strip('_')[:limit]
+    return label or '(unnamed)'
+
+
 @dataclass
 class MCPRuntime:
     resources: tuple[MCPResource, ...] = field(default_factory=tuple)
     servers: tuple[MCPServerProfile, ...] = field(default_factory=tuple)
+    # Names of project MCP servers left out because the folder is not trusted yet (folder trust)
+    skipped_untrusted: tuple[str, ...] = field(default_factory=tuple)
     # Cache for remote tools to avoid repeated subprocess spawning
     _tools_cache: tuple[McpToolRecord, ...] | None = field(default=None, init=False, repr=False)
     _tools_cache_time: float = field(default=0.0, init=False, repr=False)
@@ -267,6 +276,7 @@ class MCPRuntime:
 
         trusted = is_trusted(cwd)
         skipped_any = False
+        skipped_names: list[str] = []
         for path in paths:
             if not path.is_file():
                 continue
@@ -277,6 +287,7 @@ class MCPRuntime:
                 kept = [s for s in manifest_servers if trust_allows(
                     cwd, 'mcp', s.name, s.url or ' '.join([str(s.command or ''), *s.args]).strip())]
                 skipped_any = skipped_any or len(kept) < len(manifest_servers)
+                skipped_names.extend(s.name for s in manifest_servers if s not in kept)
                 manifest_servers = kept
                 manifest_resources = []
             resources.extend(manifest_resources)
@@ -294,9 +305,12 @@ class MCPRuntime:
                         if server is not None:
                             servers.append(server)
         disabled = disabled_mcp_servers(cwd)
+        loaded = tuple(server for server in _dedupe_servers(servers) if server.name not in disabled)
+        loaded_names = {server.name for server in loaded}
         return cls(
             resources=tuple(resources),
-            servers=tuple(server for server in _dedupe_servers(servers) if server.name not in disabled),
+            servers=loaded,
+            skipped_untrusted=tuple(n for n in dict.fromkeys(skipped_names) if n not in loaded_names),
         )
 
     @property
@@ -466,7 +480,7 @@ class MCPRuntime:
         return None
 
     def render_summary(self) -> str:
-        if not self.resources and not self.servers:
+        if not self.resources and not self.servers and not self.skipped_untrusted:
             return 'No local MCP manifests, servers, or resources discovered.'
         lines = [
             f'Local MCP manifests: {len(self.manifests)}',
@@ -491,6 +505,14 @@ class MCPRuntime:
             if status:
                 details.append(status)
             lines.append('- Server: ' + ' ; '.join(details))
+        if self.skipped_untrusted:
+            # Why: these used to be left out without a word here, so a resumed session or the model
+            # could still believe they were connected. The names come from an untrusted project file,
+            # so only a short plain label of each reaches the model (no tags, newlines or instructions).
+            lines.append(f'Not loaded until this folder is trusted ({len(self.skipped_untrusted)}): '
+                         + ', '.join(_plain_label(name) for name in self.skipped_untrusted)
+                         + '. Run /trust grant (or `sigil trust grant`), or set SIGIL_TRUST_ALL=1, then '
+                         'restart Sigil.')
         return '\n'.join(lines)
 
     def render_resource_index(
@@ -1121,7 +1143,7 @@ class _StdioMCPConnection:
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 bufsize=1,
                 cwd=self.server.cwd or None,
                 env=env,

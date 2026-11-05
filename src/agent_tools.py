@@ -75,11 +75,16 @@ def _kill_process_tree(process: 'subprocess.Popen[Any]') -> None:
     """Kill a shell and everything it started (on Windows, process.kill() only
     ends bash.exe and leaves its children - e.g. pip - running)."""
     if sys.platform == 'win32':
-        subprocess.run(
-            ['taskkill', '/PID', str(process.pid), '/T', '/F'],
-            capture_output=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-        )
+        try:
+            # timeout: a hung taskkill must not block the kill path forever
+            subprocess.run(
+                ['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                capture_output=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError) as _ignored:
+            _log_ignored(_ignored)
     try:
         process.kill()
     except OSError as _ignored:
@@ -1918,7 +1923,8 @@ def default_tool_registry() -> dict[str, SigilTool]:
                     'max_turns': {'type': 'integer', 'minimum': 1, 'maximum': 40},
                     'allow_write': {'type': 'boolean'},
                     'allow_shell': {'type': 'boolean'},
-                    'model': {'type': 'string', 'description': 'Optional model override; defaults to the current model.'},
+                    'model': {'type': 'string', 'description': 'Optional model override; defaults to the current model. May be "name" or "name@base_url" to route to another endpoint (e.g. NanoGPT/GLM).'},
+                    'base_url': {'type': 'string', 'description': 'Optional endpoint override for this background agent (e.g. https://nano-gpt.com/api/v1). Its key comes from SIGIL_API_KEY_<HOST>.'},
                 },
                 'required': ['prompt'],
             },
@@ -2066,7 +2072,7 @@ def serialize_tool_result(result: ToolExecutionResult) -> str:
     return json.dumps(payload, ensure_ascii=True, indent=2)
 
 
-_READ_ALLOW_LARGE_MAX_CHARS = 500_000
+_READ_ALLOW_LARGE_MAX_CHARS = 240_000  # ~60k tokens: full-file reads are capped so they cannot flood context
 
 
 def _truncate_output(text: str, limit: int) -> str:
@@ -3316,10 +3322,29 @@ def _web_fetch_raw(url: str, timeout: float) -> dict[str, Any]:
     raise ToolExecutionError(f'Failed to fetch {url}: too many redirects')
 
 
+def _side_call_record(client: Any, fallback_config: Any, usage: Any) -> dict[str, Any]:
+    """Usage and cost of a tool's own model call, priced by the model that answered, for the
+    tool result's metadata (the agent adds it to the session totals once)."""
+    from .agent_types import UsageStats
+    from .anthropic_client import FallbackClient
+
+    if not isinstance(usage, UsageStats):
+        return {}  # nothing reported (a stub client): nothing to count
+    config = (client.last_config if isinstance(client, FallbackClient) else None) or getattr(client, 'config', None)
+    pricing = getattr(config or fallback_config, 'pricing', None)
+    try:
+        cost = pricing.estimate_cost_usd(usage) if pricing is not None else 0.0
+    except (AttributeError, TypeError, ValueError) as exc:  # accounting never breaks the tool
+        _log_ignored(exc)
+        cost = 0.0
+    return {'side_usage': usage.to_dict(), 'side_cost_usd': cost}
+
+
 def _web_fetch_apply_prompt(
-    content: str, prompt: str, url: str, context: ToolExecutionContext, errors: list[str] | None = None
+    content: str, prompt: str, url: str, context: ToolExecutionContext, errors: list[str] | None = None,
+    side: dict[str, Any] | None = None,
 ) -> str | None:
-    """Answer the prompt from the page with a side model call."""
+    """Answer the prompt from the page with a side model call (its usage goes into `side`)."""
     try:
         from .anthropic_client import fast_client
 
@@ -3349,6 +3374,8 @@ def _web_fetch_apply_prompt(
         if errors is not None:
             errors.append(f'{type(exc).__name__}: {exc}')
         return None
+    if side is not None:  # counted even when the answer is empty: the tokens were used
+        side.update(_side_call_record(client, context.model_config, getattr(turn, 'usage', None)))
     answer = (getattr(turn, 'content', None) or '').strip()
     if not answer:
         return None
@@ -3378,10 +3405,11 @@ def _web_fetch(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
         return message, {'action': 'web_fetch', 'url': raw_url, 'redirect_to': fetched['redirect_to']}
     text = fetched['text']
     content_type = fetched['content_type']
+    side_call: dict[str, Any] = {}
     if prompt and prompt.strip() and context.model_config is not None:
         # Why: a failed side call used to return the raw page with no word about the failure.
         prompt_errors: list[str] = []
-        answer = _web_fetch_apply_prompt(text, prompt.strip(), raw_url, context, prompt_errors)
+        answer = _web_fetch_apply_prompt(text, prompt.strip(), raw_url, context, prompt_errors, side_call)
         if answer is None and prompt_errors:
             text = (f'[The prompt could not be applied ({prompt_errors[0]}); the page text follows.]\n\n'
                     + text)
@@ -3395,6 +3423,7 @@ def _web_fetch(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
                     'prompt_applied': True,
                     'fetched_chars': len(text),
                     'preview': _snapshot_text(answer),
+                    **side_call,
                 },
             )
     truncated = len(text) > max_chars
@@ -3410,6 +3439,7 @@ def _web_fetch(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
             'truncated': truncated,
             'fetched_chars': len(text),
             'preview': _snapshot_text(rendered),
+            **side_call,  # a prompt call that brought no answer still used tokens
         },
     )
 
@@ -3420,12 +3450,19 @@ def _rollback_workspace_tool(arguments: dict[str, Any], context: ToolExecutionCo
         raise ToolPermissionError(
             'rollback_workspace is a destructive operation (git reset --hard + clean). '
             'Enable destructive shell commands to use it.')
-    try:
-        subprocess.run(['git', 'reset', '--hard', 'HEAD'], cwd=context.root, capture_output=True)
-        subprocess.run(['git', 'clean', '-fd'], cwd=context.root, capture_output=True)
-        return "Workspace successfully rolled back to last checkpoint."
-    except Exception as e:
-        raise ToolExecutionError(f"Rollback failed: {e}")
+    from .worktree_runtime import git_kwargs
+
+    for command in (['git', 'reset', '--hard', 'HEAD'], ['git', 'clean', '-fd']):
+        try:
+            done = subprocess.run(command, cwd=context.root, capture_output=True, text=True, encoding='utf-8', errors='replace', **git_kwargs())
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ToolExecutionError(f'Rollback failed: {" ".join(command)}: {exc}') from exc
+        if done.returncode != 0:
+            # Why: the exit codes were ignored, so a failed reset (no git repo, a lock) still
+            # reported success.
+            detail = (done.stderr or done.stdout or '').strip()
+            raise ToolExecutionError(f'Rollback failed: {" ".join(command)} exited {done.returncode}: {detail}')
+    return 'Workspace successfully rolled back to last checkpoint.'
 
 
 def _search_status(arguments: dict[str, Any], context: ToolExecutionContext) -> str:
@@ -4619,9 +4656,12 @@ def _todo_write(arguments: dict[str, Any], context: ToolExecutionContext) -> str
     )
 
 
+_BASH_STREAM_DEFAULT_CAP_CHARS = 240_000  # ~60k tokens: stops one cat/grep on a huge file from flooding context
+
+
 def _bash_stream_cap(max_output_chars: int) -> int:
     """PC-safety cap on what one streamed bash command keeps in memory and streams:
-    SIGIL_BASH_STREAM_MAX_CHARS (default 10 x max_output_chars; 0 = no cap)."""
+    SIGIL_BASH_STREAM_MAX_CHARS (default 10 x max_output_chars, at most 240,000; 0 = no cap)."""
     raw = os.environ.get('SIGIL_BASH_STREAM_MAX_CHARS', '').strip()
     if raw:
         try:
@@ -4631,7 +4671,10 @@ def _bash_stream_cap(max_output_chars: int) -> int:
 
             get_logger('tools').debug('SIGIL_BASH_STREAM_MAX_CHARS=%s is not a number; default used',
                                       sanitize_log(raw, 40))
-    return max(0, int(max_output_chars or 0)) * 10
+    # Why: 10 x a large max_output_chars kept far more output in memory than anyone reads.
+    # The ceiling is ~60k tokens, but never below the per-tool output size itself.
+    limit = max(0, int(max_output_chars or 0))
+    return max(limit, min(limit * 10, _BASH_STREAM_DEFAULT_CAP_CHARS))
 
 
 class _HeadTailText:
@@ -4873,7 +4916,32 @@ def _background_agent_start(arguments: dict[str, Any], context: ToolExecutionCon
     # Same rule as delegate_agent: a child can only get permissions the parent already has.
     allow_write = context.permissions.allow_file_write and bool(arguments.get('allow_write', False))
     allow_shell = context.permissions.allow_shell_commands and bool(arguments.get('allow_shell', False))
-    model = str(arguments.get('model') or model_config.model)
+    # Background agents can be routed to another endpoint (e.g. NanoGPT/GLM):
+    # model may be "name" or "name@base_url", and base_url can be given on its own.
+    raw_model = str(arguments.get('model') or model_config.model)
+    name, _, model_url = raw_model.rpartition('@')
+    if not model_url.strip().lower().startswith(('http://', 'https://')):
+        # Why: some model ids contain '@' (e.g. Vertex 'claude-3-5-sonnet@20240620').
+        name, model_url = raw_model, ''
+    model = name.strip() or model_config.model
+    base_url_arg = str(arguments.get('base_url') or model_url or '').strip()
+    if base_url_arg and not base_url_arg.lower().startswith(('http://', 'https://')):
+        raise ToolExecutionError(f'base_url must start with http:// or https://: {base_url_arg}')
+    if base_url_arg and base_url_arg != str(model_config.base_url):
+        from .profiles import config_for_endpoint
+        # config_for_endpoint keeps the main key only for the same host; another host
+        # gets SIGIL_API_KEY_<HOST> (or 'local-token'), so the main key never leaks.
+        target_config = config_for_endpoint(model_config, model, base_url_arg)
+    elif model != model_config.model:
+        from dataclasses import replace as _replace
+
+        from .prompt_cache import reprice
+
+        base_url = str(model_config.base_url)
+        target_config = _replace(model_config, model=model, pricing=reprice(
+            model_config.pricing, base_url, model_config.model, base_url, model))
+    else:
+        target_config = model_config
 
     runtime = _background_runtime_for(context)
     from .background_runtime import background_limit_message
@@ -4886,7 +4954,7 @@ def _background_agent_start(arguments: dict[str, Any], context: ToolExecutionCon
         '--cwd', str(context.root),
         '--max-turns', str(max_turns),
         '--model', model,
-        '--base-url', str(model_config.base_url),
+        '--base-url', str(target_config.base_url),
         '--timeout-seconds', str(getattr(model_config, 'timeout_seconds', 120.0)),
         '--background-root', str(runtime.root),
     ]
@@ -4896,16 +4964,24 @@ def _background_agent_start(arguments: dict[str, Any], context: ToolExecutionCon
         forwarded.append('--allow-shell')
     for path in context.additional_working_directories:
         forwarded.extend(['--add-dir', str(path)])
-    # The parent's live state: effort, sampling, pricing and permission mode.
+    # The parent's live state: effort, sampling, pricing and permission mode. Cache prices are the
+    # ones for the agent's own model and endpoint (derived again for another one; flag prices kept).
     effort = getattr(model_config, 'effort', None)
     if effort:
         forwarded.extend(['--effort', str(effort)])
     if getattr(model_config, 'temperature', None) is not None:
         forwarded.extend(['--temperature', str(model_config.temperature)])
-    pricing = getattr(model_config, 'pricing', None)
+    pricing = getattr(target_config, 'pricing', None)
     if pricing is not None:
         forwarded.extend(['--input-cost-per-million', str(pricing.input_cost_per_million_tokens_usd),
                           '--output-cost-per-million', str(pricing.output_cost_per_million_tokens_usd)])
+        # cache prices go along only when set, so an unset one is never sent as "0.0" or "None"
+        for flag, value in (
+                ('--cache-read-cost-per-million', pricing.cache_read_input_cost_per_million_tokens_usd),
+                ('--cache-write-cost-per-million', pricing.cache_creation_input_cost_per_million_tokens_usd),
+                ('--cache-write-1h-cost-per-million', pricing.cache_creation_1h_input_cost_per_million_tokens_usd)):
+            if value:
+                forwarded.extend([flag, str(value)])
     if context.permission_mode in ('plan', 'acceptEdits', 'bypass', 'dontAsk'):
         forwarded.extend(['--permission-mode', context.permission_mode])
     # The parent's own limits go along, as with `sigil agent-bg`: a background agent never has
@@ -4926,7 +5002,13 @@ def _background_agent_start(arguments: dict[str, Any], context: ToolExecutionCon
     env = dict(os.environ)
     from .main import _forward_key
 
-    _forward_key(env, str(model_config.base_url or ''), str(model_config.api_key))
+    _forward_key(env, str(target_config.base_url or ''), str(target_config.api_key))
+    from .prompt_cache import forward_env
+
+    forward_env(env)  # this session's /cache choice; unset values are not written
+    from .explicit_cache import forward_env as forward_explicit
+
+    forward_explicit(env)  # and /cache explicit
     env['PYTHONIOENCODING'] = 'utf-8'
     env['SIGIL_BACKGROUND'] = '1'
     from .child_env import strip_ssh_agent
@@ -4946,6 +5028,7 @@ def _background_agent_start(arguments: dict[str, Any], context: ToolExecutionCon
             f'Background agent started: {record.background_id}',
             f'- pid: {record.pid}',
             f'- model: {model}',
+            f'- endpoint: {target_config.base_url}',
             f'- permissions: write={allow_write} shell={allow_shell}',
             f'- log: {record.log_path}',
             'It runs independently; keep working and check it with background_agent_status.',
@@ -4973,6 +5056,15 @@ def _background_agent_status(arguments: dict[str, Any], context: ToolExecutionCo
         text += ('\n\n# Result\n' + str(result.get('final_output', '')).strip()
                  + f"\n\nstop_reason={result.get('stop_reason')} session_id={result.get('session_id')} "
                  f"cost_usd={result.get('total_cost_usd')}")
+        usage = result.get('usage')
+        if isinstance(usage, dict):
+            def count(name: str) -> int:
+                value = usage.get(name)
+                return value if isinstance(value, int) and not isinstance(value, bool) else 0
+            read, written = count('cache_read_input_tokens'), count('cache_creation_input_tokens')
+            # input_tokens in the record is the uncached part; the total adds the cached tokens back
+            text += (f"\ninput_tokens={count('input_tokens') + read + written} output_tokens={count('output_tokens')} "
+                     f"cache_read={read} cache_write={written} cache_write_1h={count('cache_creation_1h_input_tokens')}")
     return (
         _truncate_output(text, context.max_output_chars),
         {'action': 'background_agent_status', 'background_id': background_id, 'status': record.status},
@@ -4991,6 +5083,12 @@ def _background_agent_restart(arguments: dict[str, Any], context: ToolExecutionC
         from .main import _forward_key
 
         _forward_key(env, str(context.model_config.base_url or ''), str(context.model_config.api_key))
+    from .prompt_cache import forward_env
+
+    forward_env(env)  # this session's /cache choice; unset values are not written
+    from .explicit_cache import forward_env as forward_explicit
+
+    forward_explicit(env)  # and /cache explicit
     env['PYTHONIOENCODING'] = 'utf-8'
     env['SIGIL_BACKGROUND'] = '1'
     from .child_env import strip_ssh_agent
@@ -5122,6 +5220,17 @@ def _require_mcp_runtime(context: ToolExecutionContext):
             and not context.mcp_runtime.servers
         )
     ):
+        skipped = tuple(getattr(context.mcp_runtime, 'skipped_untrusted', ()) or ())
+        if skipped:
+            # Why: this used to say "add a manifest" although the folder has one and folder trust left its
+            # servers out. Names come from an untrusted project file, so only plain labels are shown.
+            from .mcp_runtime import _plain_label
+
+            raise ToolExecutionError(
+                f'No MCP servers are loaded: {len(skipped)} in this folder wait for folder trust ('
+                + ', '.join(_plain_label(name) for name in skipped)
+                + '). Run /trust grant (or `sigil trust grant`), or set SIGIL_TRUST_ALL=1, then restart Sigil.'
+            )
         raise ToolExecutionError(
             'No MCP runtime is available. Add a .sigil-mcp.json, .mcp.json, or mcpServers manifest first.'
         )

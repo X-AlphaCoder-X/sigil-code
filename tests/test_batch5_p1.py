@@ -72,7 +72,13 @@ class AnthropicClientTests(unittest.TestCase):
         tools = [{'type': 'function', 'function': {'name': 'read_file', 'description': 'd',
                                                    'parameters': {'type': 'object', 'properties': {}}}}]
         messages = [{'role': 'system', 'content': 'S'}, {'role': 'user', 'content': 'hi'}]
-        with patch.dict(os.environ, {'SIGIL_EFFORT_LEVEL': ''}):
+        with patch.dict(os.environ, {'SIGIL_EFFORT_LEVEL': '', 'SIGIL_PROMPT_CACHE': '', 'SIGIL_PROMPT_CACHE_TTL': ''}):
+            # 1.1.0: the default cache lifetime is 1 hour (each breakpoint says so)
+            hour = AnthropicClient(ModelConfig(model='claude-x', base_url=ANTHROPIC)).build_payload(messages, tools)
+        self.assertEqual(hour['system'][-1]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
+        self.assertEqual(hour['tools'][-1]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
+        self.assertEqual(hour['messages'][-1]['content'][-1]['cache_control'], {'type': 'ephemeral', 'ttl': '1h'})
+        with patch.dict(os.environ, {'SIGIL_EFFORT_LEVEL': '', 'SIGIL_PROMPT_CACHE_TTL': '5m'}):
             plain = AnthropicClient(ModelConfig(model='claude-x', base_url=ANTHROPIC)).build_payload(messages, tools)
             # Claude 4.5 and earlier: manual budget (Anthropic API docs, extended thinking)
             thinking = AnthropicClient(ModelConfig(model='claude-sonnet-4-5', base_url=ANTHROPIC, effort='high',
@@ -84,7 +90,8 @@ class AnthropicClientTests(unittest.TestCase):
                                                  temperature=0.2)).build_payload(messages, tools)
             modern_plain = AnthropicClient(ModelConfig(model='claude-sonnet-5', base_url=ANTHROPIC,
                                                        temperature=0.2)).build_payload(messages, tools)
-        self.assertEqual(modern['thinking'], {'type': 'adaptive'})
+        # Claude 5.1+ also asks the API to drop a replayed thinking block whose context changed
+        self.assertEqual(modern['thinking'], {'type': 'adaptive', 'block_binding': {'prefix_mismatch_behavior': 'drop_block'}})
         self.assertEqual(modern['output_config'], {'effort': 'high'})
         self.assertNotIn('temperature', modern)
         self.assertNotIn('temperature', modern_plain)
@@ -99,9 +106,17 @@ class AnthropicClientTests(unittest.TestCase):
         self.assertEqual(warm['temperature'], 1.0)
 
     def test_selection_is_opt_in(self) -> None:
+        # 1.1.0: native by default for anthropic.com (the compat endpoint cannot cache prompts);
+        # SIGIL_ANTHROPIC_NATIVE=0 is the opt-out.
         config = ModelConfig(model='claude-x', base_url=ANTHROPIC)
         with patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': ''}):
-            self.assertIsInstance(make_client(config), OpenAICompatClient)
+            self.assertIsInstance(make_client(config), AnthropicClient)
+        for off in ('0', 'off', 'false', 'no'):
+            with patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': off}):
+                self.assertIsInstance(make_client(config), OpenAICompatClient)
+        with patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': ''}):
+            look_alike = ModelConfig(model='claude-x', base_url='https://evilanthropic.com/v1')
+            self.assertIsInstance(make_client(look_alike), OpenAICompatClient)
         with patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': '1'}):
             self.assertIsInstance(make_client(config), AnthropicClient)
             self.assertIsInstance(make_client(ModelConfig(model='m')), OpenAICompatClient)

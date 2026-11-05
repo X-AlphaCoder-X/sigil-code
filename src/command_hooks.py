@@ -46,10 +46,12 @@ fall through to the normal permission checks), ``permissionDecisionReason``,
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import subprocess
 import threading
+import time
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -275,12 +277,20 @@ class CommandHookRuntime:
     # Set by the agent.
     common_fields: Callable[[dict], dict] | None = None
 
-    @classmethod
-    def from_workspace(cls, cwd: Path, *, include_project: bool = True) -> 'CommandHookRuntime':
-        cwd = cwd.resolve()
-        if os.environ.get('SIGIL_SAFE_MODE') == '1':
-            return cls(cwd=cwd)  # --safe-mode: no hooks
-        from .settings import extra_settings, setting_sources
+    # Settings files this runtime was read from, re-checked on every hook call so an edit takes
+    # effect without a restart. Empty (hooks built in code, tests, --safe-mode): never reloaded.
+    watch: tuple[tuple[str, Path], ...] = field(default=(), repr=False, compare=False)
+    # Hooks that do not come from those files (--settings, plugins, an agent's own hooks). Kept on reload.
+    fixed_hooks: tuple[CommandHook, ...] = field(default=(), repr=False, compare=False)
+    fixed_errors: tuple[str, ...] = field(default=(), repr=False, compare=False)
+    fixed_disabled: bool = field(default=False, repr=False, compare=False)
+    _signature: Any = field(default=None, init=False, repr=False, compare=False)
+    _bad_signature: Any = field(default=None, init=False, repr=False, compare=False)
+    _reload_lock: Any = field(default_factory=threading.Lock, init=False, repr=False, compare=False)
+
+    @staticmethod
+    def _workspace_sources(cwd: Path, include_project: bool) -> list[tuple[str, Path]]:
+        from .settings import setting_sources
 
         allowed = setting_sources()
         sources: list[tuple[str, Path]] = []
@@ -297,9 +307,39 @@ class CommandHookRuntime:
                     sources.append(('local', cwd / '.sigil' / 'settings.local.json'))
             else:
                 report_skipped(cwd)
+        return sources
+
+    @staticmethod
+    def _files_signature(sources: tuple[tuple[str, Path], ...]) -> tuple:
+        """(path, mtime_ns, size[, content hash]) of each settings file. A missing or unreadable file
+        counts too (with the error name, so "access denied" is not taken for "no file"), so creating one
+        is seen. A file changed in the last 2 seconds also gets a hash of its bytes: two saves in one
+        clock tick with the same size would otherwise look unchanged (the same check git uses)."""
+        signature = []
+        now = time.time_ns()
+        for _label, path in sources:
+            try:
+                stat = path.stat()
+            except OSError as exc:
+                signature.append((str(path), None, type(exc).__name__))
+                continue
+            entry: tuple = (str(path), stat.st_mtime_ns, stat.st_size)
+            if now - stat.st_mtime_ns < 2_000_000_000:
+                try:
+                    entry += (hashlib.sha256(path.read_bytes()).hexdigest(),)
+                except OSError as exc:
+                    entry += (type(exc).__name__,)
+            signature.append(entry)
+        return tuple(signature)
+
+    @staticmethod
+    def _read_files(sources: tuple[tuple[str, Path], ...]) -> tuple[list[CommandHook], list[str], bool, bool]:
+        """(hooks, errors, disableAllHooks, unreadable). unreadable: a file exists but could not be read
+        or parsed (often half-written by an editor or another session)."""
         hooks: list[CommandHook] = []
         errors: list[str] = []
         disabled = False
+        unreadable = False
         seen: set[Path] = set()
         for label, path in sources:
             try:
@@ -312,32 +352,91 @@ class CommandHookRuntime:
             seen.add(resolved)
             try:
                 payload = json.loads(resolved.read_text(encoding='utf-8'))
-            except (OSError, json.JSONDecodeError) as exc:
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 errors.append(f'{resolved}: {exc}')
+                unreadable = True
                 continue
             if not isinstance(payload, dict):
                 continue
             if payload.get('disableAllHooks') is True:
                 disabled = True
             hooks.extend(_parse_hooks(payload.get('hooks'), f'{label}:{resolved}', errors))
+        return hooks, errors, disabled, unreadable
+
+    @classmethod
+    def from_workspace(cls, cwd: Path, *, include_project: bool = True) -> 'CommandHookRuntime':
+        cwd = cwd.resolve()
+        if os.environ.get('SIGIL_SAFE_MODE') == '1':
+            return cls(cwd=cwd)  # --safe-mode: no hooks
+        sources = tuple(cls._workspace_sources(cwd, include_project))
+        signature = cls._files_signature(sources)
+        hooks, errors, disabled, _unreadable = cls._read_files(sources)
+        fixed: list[CommandHook] = []
+        fixed_errors: list[str] = []
+        fixed_disabled = False
+        from .settings import extra_settings
+
         extra = extra_settings()
         if extra:
             if extra.get('disableAllHooks') is True:
-                disabled = True
-            hooks.extend(_parse_hooks(extra.get('hooks'), 'settings-flag', errors))
+                fixed_disabled = True
+            fixed.extend(_parse_hooks(extra.get('hooks'), 'settings-flag', fixed_errors))
         from .sigil_plugins import loaded_plugins
 
         for plugin in loaded_plugins():  # --plugin-dir: hooks/hooks.json
             if plugin.hooks:
-                hooks.extend(_parse_hooks(plugin.hooks, f'plugin:{plugin.name}', errors))
-        if disabled:
-            hooks = []
-        return cls(cwd=cwd, hooks=tuple(hooks), load_errors=tuple(errors))
+                fixed.extend(_parse_hooks(plugin.hooks, f'plugin:{plugin.name}', fixed_errors))
+        combined = [] if (disabled or fixed_disabled) else [*hooks, *fixed]
+        runtime = cls(cwd=cwd, hooks=tuple(combined), load_errors=tuple(errors + fixed_errors),
+                      watch=sources, fixed_hooks=tuple(fixed), fixed_errors=tuple(fixed_errors),
+                      fixed_disabled=fixed_disabled)
+        runtime._signature = signature
+        return runtime
+
+    def refresh(self) -> bool:
+        """Re-read the settings files if one changed since the last read. Called before every hook
+        check, so an edit applies on the next call without a restart. It only reads files, so two
+        sessions on one folder cannot disturb each other. A file that cannot be parsed (half-written,
+        broken JSON) keeps the last good hooks and is reported once; it is read again when it changes.
+        SIGIL_HOOKS_RELOAD=0 reads the files only at start. Returns whether the hooks changed."""
+        if not self.watch or os.environ.get('SIGIL_HOOKS_RELOAD', '').strip().lower() in ('0', 'off', 'false', 'no'):
+            return False
+        signature = self._files_signature(self.watch)
+        if signature == self._signature:
+            return False
+        with self._reload_lock:
+            if signature == self._signature or signature == self._bad_signature:
+                return False
+            hooks, errors, disabled, unreadable = self._read_files(self.watch)
+            if unreadable:
+                self._bad_signature = signature
+                from .debug_log import get_logger, sanitize_log
+
+                message = ('hook settings changed but could not be read; keeping the previous hooks: '
+                           + sanitize_log('; '.join(errors), 300))
+                get_logger('hooks').warning(message)
+                try:
+                    sys.stderr.write(f'\033[33mSigil: {message}\033[0m\n')
+                except (OSError, ValueError) as _ignored:  # stderr closed in a detached worker
+                    _log_ignored(_ignored)
+                return False
+            combined = tuple([] if (disabled or self.fixed_disabled) else [*hooks, *self.fixed_hooks])
+            changed = combined != self.hooks
+            self.hooks = combined
+            self.load_errors = tuple(errors) + self.fixed_errors
+            self._signature = signature
+            self._bad_signature = None
+            if changed:
+                from .debug_log import get_logger
+
+                get_logger('hooks').info('hook settings changed on disk; %d hook(s) now active', len(self.hooks))
+            return changed
 
     def run_if_configured(self, event: str, payload: dict[str, Any]) -> 'HookOutcome | None':
         return self.run(event, payload) if self.has(event) else None
 
     def has(self, event: str) -> bool:
+        self.refresh()
         return any(hook.event == event for hook in self.hooks)
 
     def run(
@@ -348,6 +447,7 @@ class CommandHookRuntime:
         tool_name: str | None = None,
     ) -> HookOutcome:
         outcome = HookOutcome()
+        self.refresh()
         selected = [h for h in self.hooks if h.event == event and _matches(h.matcher, tool_name)
                     and _condition_matches(h.condition, tool_name, payload.get('tool_input'), self.cwd)]
         if not selected:
@@ -575,7 +675,16 @@ def fire_session_end(runtime: 'CommandHookRuntime | None', session_id: str | Non
     """Run SessionEnd hooks (reason: 'exit', 'clear', 'logout', 'prompt_input_exit', 'other').
 
     SessionEnd cannot block anything; failures are swallowed so exit always succeeds.
+    Explicit context caches (Gemini, Vertex) of this process are deleted here too.
     """
+    try:
+        from .explicit_cache import release_all
+
+        release_all(f'session end ({reason})')
+    except Exception as _ignored:  # exit must not fail
+        from .debug_log import log_ignored_error
+
+        log_ignored_error(_ignored)
     if runtime is None or not runtime.has('SessionEnd'):
         return
     try:

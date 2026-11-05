@@ -28,6 +28,7 @@ from .debug_log import log_ignored_error as _log_ignored  # handled errors still
 MICROCOMPACT_KIND = 'microcompacted_tool_result'
 DEFAULT_KEEP_RECENT = 5
 DEFAULT_MIN_CHARS = 8000
+DEFAULT_CACHE_BATCH = 3
 _PREVIEW_CHARS = 600
 
 
@@ -36,6 +37,20 @@ class MicrocompactResult:
     offloaded_count: int = 0
     chars_removed: int = 0
     paths: tuple[str, ...] = ()
+
+
+def cache_friendly_batch(last_call_monotonic: float | None, now: float) -> int:
+    """How many results to move at once in the agent loop: SIGIL_MICROCOMPACT_BATCH (default 3)
+    while the prompt cache is warm; 1 (move now) when caching is off or the cache has expired
+    (nothing cached is lost then)."""
+    from .prompt_cache import TTL_SECONDS, current_settings
+
+    settings = current_settings()
+    if settings.mode == 'off' or last_call_monotonic is None:
+        return 1
+    if now - last_call_monotonic > TTL_SECONDS.get(settings.ttl, 300):
+        return 1
+    return max(1, _env_int('SIGIL_MICROCOMPACT_BATCH', DEFAULT_CACHE_BATCH))
 
 
 def _env_int(name: str, default: int) -> int:
@@ -53,7 +68,11 @@ def microcompact_session(
     *,
     keep_recent: int | None = None,
     min_chars: int | None = None,
+    batch: int = 1,
 ) -> MicrocompactResult:
+    """Move bulky older tool results to files. batch > 1 waits until that many results qualify and
+    moves them together: each move changes an old message, which makes the provider re-write its
+    prompt cache from there, so batching keeps the cached prefix stable between moves."""
     if os.environ.get('SIGIL_DISABLE_MICROCOMPACT', '').strip().lower() in {'1', 'true', 'yes', 'on'}:
         return MicrocompactResult()
     keep_recent = _env_int('SIGIL_MICROCOMPACT_KEEP_RECENT', DEFAULT_KEEP_RECENT) if keep_recent is None else keep_recent
@@ -61,6 +80,12 @@ def microcompact_session(
 
     tool_indexes = [i for i, m in enumerate(session.messages) if m.role == 'tool']
     cold = tool_indexes[: max(len(tool_indexes) - keep_recent, 0)]
+    cold = [index for index in cold
+            if session.messages[index].metadata.get('kind') not in {MICROCOMPACT_KIND, 'snipped_message'}
+            and session.messages[index].state != 'tombstoned'
+            and len(session.messages[index].content) > min_chars]
+    if len(cold) < max(1, batch):
+        return MicrocompactResult()
     offloaded = 0
     removed = 0
     paths: list[str] = []

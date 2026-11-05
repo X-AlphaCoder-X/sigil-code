@@ -118,7 +118,7 @@ class QueryEnginePort:
         if self.config.use_runtime_agent and self.runtime_agent is not None:
             result = self._submit_runtime_message(prompt)
             cumulative_usage = UsageSummary(
-                input_tokens=result.usage.input_tokens,
+                input_tokens=result.usage.prompt_tokens,  # cached tokens included (split out of input_tokens)
                 output_tokens=result.usage.output_tokens,
             )
             usage = cumulative_usage

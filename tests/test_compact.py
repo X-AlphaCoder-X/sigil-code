@@ -213,19 +213,34 @@ class TestCompactConversation(unittest.TestCase):
         msgs.append(AgentMessage(role='assistant', content='final', message_id='a9', tool_calls=(call(8), call(9))))
         msgs.append(AgentMessage(role='tool', content='r8', message_id='t8', tool_call_id='c8', name='bash'))
         msgs.append(AgentMessage(role='tool', content='r9', message_id='t9', tool_call_id='c9', name='bash'))
+        def reply(content: str) -> AssistantTurn:
+            return AssistantTurn(content=content, tool_calls=(), finish_reason='stop', raw_message={},
+                                 usage=UsageStats())
+
         with tempfile.TemporaryDirectory() as tmp_dir:
             agent = self._make_agent(tmp_dir)
             agent.runtime_config = replace(agent.runtime_config, compact_preserve_messages=2)
             self._set_session(agent, msgs)
             agent.client = MagicMock()
-            agent.client.complete.return_value = AssistantTurn(
-                content='<summary>done</summary>', tool_calls=(), finish_reason='stop',
-                raw_message={}, usage=UsageStats(),
-            )
+            agent.client.complete.return_value = reply('<summary>done</summary>')
             result = compact_conversation(agent)
+            # 1.1.0: the first request is the main loop's own (tool calls and results as they are) so
+            # it reads the prompt cache; tool calls therefore always go with the tool definitions.
+            sent, tools = agent.client.complete.call_args_list[0][0][:2]
+            self.assertTrue(any('tool_calls' in m for m in sent))
+            self.assertTrue(tools, 'tool calls were sent without tool definitions')
+            self.assertEqual([t['function']['name'] for t in tools],
+                             [t['function']['name'] for t in (tool.to_openai_tool() for tool in agent.tool_registry.values())])
+            # When that brings no text, the plain-text transcript (no tool messages, tools=[]) is sent.
+            self._set_session(agent, msgs)
+            agent.client = MagicMock()
+            agent.client.complete.side_effect = [reply(''), reply('<summary>done</summary>')]
+            fallback_result = compact_conversation(agent)
 
         self.assertIsNone(result.error)
-        sent = agent.client.complete.call_args[0][0]
+        self.assertIsNone(fallback_result.error)
+        sent, tools = agent.client.complete.call_args_list[-1][0][0], agent.client.complete.call_args_list[-1][1].get('tools')
+        self.assertEqual(tools, [])
         self.assertTrue(all(m['role'] in ('system', 'user') for m in sent))
         self.assertFalse(any('tool_calls' in m or 'tool_call_id' in m for m in sent))
         self.assertIn('[tool call: bash]', sent[-1]['content'])

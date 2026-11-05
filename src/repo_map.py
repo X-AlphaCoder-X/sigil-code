@@ -64,7 +64,7 @@ def enabled(cwd: Path) -> bool:
 def list_files(root: Path) -> list[str]:
     try:
         result = subprocess.run(['git', 'ls-files', '--cached', '--others', '--exclude-standard'], cwd=root,
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=15)
         if result.returncode == 0 and result.stdout.strip():
             files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
             return sorted(f for f in files if not (set(Path(f).parts) & SKIP_DIRS))[:MAX_FILES]

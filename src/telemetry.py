@@ -70,7 +70,12 @@ def record(event: dict[str, Any]) -> None:
     if kind == 'model_usage':
         name = 'sigil.model_request'
         attrs = {key: event.get(key) for key in ('model', 'input_tokens', 'output_tokens',
-                                                  'cache_read_input_tokens', 'cost_usd', 'turn_index')}
+                                                  'cache_read_input_tokens', 'cache_creation_input_tokens',
+                                                  'cache_creation_1h_input_tokens', 'cache_hit_rate',
+                                                  'cost_usd', 'turn_index')}
+    elif kind == 'explicit_cache':
+        name = 'sigil.explicit_cache'
+        attrs = {key: event.get(key) for key in ('action', 'model', 'tokens', 'storage_cost_usd')}
     elif kind == 'tool_result':
         name = 'sigil.tool_result'
         attrs = {'tool_name': event.get('tool_name'), 'success': bool(event.get('ok'))}

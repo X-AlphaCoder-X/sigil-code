@@ -527,6 +527,11 @@ def get_slash_command_specs() -> tuple[SlashCommandSpec, ...]:
             handler=_handle_cost,
         ),
         SlashCommandSpec(
+            names=('cache', 'prompt-cache'),
+            description='Prompt cache: hit rate and tokens; /cache on|off|auto, /cache ttl 5m|1h|24h, /cache reset.',
+            handler=_handle_cache,
+        ),
+        SlashCommandSpec(
             names=('exit', 'quit'),
             description='Exit the REPL.',
             handler=_handle_exit,
@@ -630,7 +635,108 @@ def _handle_help(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Slas
 
 def _handle_context(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
     prompt = args or None
-    return _local_result(input_text, agent.render_context_report(prompt))
+    report = agent.render_context_report(prompt)
+    cache = _cache_usage_lines(getattr(agent, 'cumulative_usage', None))
+    if cache:
+        report = report.rstrip('\n') + '\n\nPrompt cache (this session):\n' + '\n'.join(cache)
+    return _local_result(input_text, report)
+
+
+def _storage_cost() -> float:
+    from . import explicit_cache
+
+    return explicit_cache.storage_cost_usd()
+
+
+def _cache_usage_lines(usage: Any) -> list[str]:
+    """Cache lines for /cost, /usage, /stats and /cache; empty when nothing was read or written."""
+    if usage is None or not (usage.cache_read_input_tokens or usage.cache_creation_input_tokens):
+        return []
+    lines = []
+    rate = usage.cache_hit_rate
+    if rate is not None:
+        lines.append(f'Cache hit rate:        {rate:.0%} of prompt tokens read from the cache')
+    lines.append(f'Cache read tokens:     {usage.cache_read_input_tokens:,}')
+    written_1h = getattr(usage, 'cache_creation_1h_input_tokens', 0)
+    lines.append(f'Cache write tokens:    {usage.cache_creation_input_tokens:,}'
+                 + (f' ({written_1h:,} with the 1h TTL)' if written_1h else ''))
+    lines.append(f'Uncached input tokens: {usage.input_tokens:,}')
+    return lines
+
+
+def _handle_cache(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashCommandResult:
+    """/cache [on|off|auto|ttl <5m|1h|24h>|<5m|1h|24h>|reset]: show or change prompt caching for
+    this session (background agents started later get the same choice)."""
+    from . import prompt_cache
+
+    words = args.strip().lower().split()
+    notes: list[str] = []
+    if words:
+        if words[0] == 'reset':
+            prompt_cache.set_session(clear=True)
+            notes.append('Prompt cache settings reset to the environment / settings values.')
+        elif words[0] in ('on', 'off', 'auto'):
+            prompt_cache.set_session(mode=words[0])
+            notes.append(f'Prompt caching is {words[0]} for this session.')
+        elif words[0] in ('ttl', 'timer') or words[0] in prompt_cache.TTL_WORDS:
+            value = words[1] if words[0] in ('ttl', 'timer') and len(words) > 1 else words[0]
+            ttl = prompt_cache.parse_ttl(value, '/cache ttl')
+            if ttl is None:
+                return _local_result(input_text, _CACHE_USAGE)
+            prompt_cache.set_session(ttl=ttl)
+            notes.append(f'Prompt cache TTL is {ttl} for this session.')
+        elif words[0] == 'explicit' and len(words) > 1 and words[1] in ('on', 'off', 'auto'):
+            from . import explicit_cache
+
+            explicit_cache.set_session_mode(words[1])
+            notes.append(f'Explicit caches (Gemini, Vertex) are {words[1]} for this session.')
+        elif words[0] == 'delete' and len(words) > 1:
+            from . import explicit_cache
+
+            # the name keeps its case (cachedContents/AbC...); only the words above are lowercased
+            name = args.strip().split()[1]
+            removed = explicit_cache.delete('all' if name.lower() == 'all' else name)
+            notes.append(f'Deleted {len(removed)} explicit cache(s)' + (f': {", ".join(removed)}' if removed else '.'))
+        elif words[0] != 'list':
+            return _local_result(input_text, _CACHE_USAGE)
+    settings = prompt_cache.current_settings(agent.runtime_config.cwd)
+    config = agent.model_config
+    from .anthropic_client import use_native_anthropic
+
+    plan = prompt_cache.plan_for(config.base_url, config.model, native=use_native_anthropic(config),
+                                 cwd=agent.runtime_config.cwd)
+    lines = notes + [
+        f'Mode:      {settings.mode} (from {settings.mode_source})',
+        f'TTL:       {settings.ttl} (from {settings.ttl_source})',
+        f'Provider:  {plan.provider} ({config.model})',
+        f'Method:    {plan.note or "none"}',
+    ]
+    usage_lines = _cache_usage_lines(getattr(agent, 'cumulative_usage', None))
+    lines += usage_lines or ['No cache reads or writes reported yet in this session.']
+    lines += _explicit_cache_lines(with_list=True)
+    return _local_result(input_text, '\n'.join(lines))
+
+
+_CACHE_USAGE = ('Usage: /cache [on|off|auto|ttl 5m|1h|24h|reset|explicit on|off|auto|list|delete <name|all>]')
+
+
+def _explicit_cache_lines(with_list: bool = False) -> list[str]:
+    """Explicit caches (Gemini, Vertex): mode, storage cost so far and, for /cache, each live one."""
+    from . import explicit_cache
+
+    caches = explicit_cache.live_caches()
+    storage = explicit_cache.storage_cost_usd()
+    lines: list[str] = []
+    if with_list:
+        lines.append(f'Explicit caches: {explicit_cache.mode()} (SIGIL_EXPLICIT_CACHE, /cache explicit); '
+                     f'{len(caches)} live')
+        for cache in caches:
+            minutes = cache['expires_in_seconds'] // 60
+            lines.append(f"  {cache['name']}  {cache['model']}  {cache['tokens']:,} tokens  expires in {minutes} min  "
+                         f"used {cache['uses']}x  storage ${cache['storage_cost_usd']:.4f}")
+    if storage or caches:
+        lines.append(f'Cache storage:         ${storage:.4f} (explicit caches, included in the total)')
+    return lines
 
 
 def _handle_context_raw(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
@@ -1466,7 +1572,8 @@ def _mcp_server_command(agent: 'LocalCodingAgent', verb: str, name: str) -> str:
 
         message = mcp_auth_command(agent.mcp_runtime, verb, name)
         if message.startswith('Logged in to') and 'still failed' not in message:
-            agent.tool_registry = agent._register_mcp_tools(agent.tool_registry)  # its tools work from now on
+            # its tools work from now on (--tools / --disallowed-tools still apply)
+            agent.tool_registry = agent._apply_cli_tool_limits(agent._register_mcp_tools(agent.tool_registry))
         return message
     if verb == 'reconnect':
         server = agent.mcp_runtime.get_server(name) if agent.mcp_runtime is not None else None
@@ -1479,12 +1586,30 @@ def _mcp_server_command(agent: 'LocalCodingAgent', verb: str, name: str) -> str:
         except Exception as exc:
             return f'Could not reconnect {name}: {exc}'
         return f'Reconnected {name}'
+    from .debug_log import get_logger
+    from .mcp_runtime import _plain_label
+
+    label = _plain_label(name)  # typed by the user, but logged and shown as a plain label only
     path = agent.runtime_config.cwd / LOCAL_SETTINGS
     payload = read_settings_file(path)
     disabled = [str(item) for item in payload.get('disabledMcpServers', []) if isinstance(item, str)]
-    if verb == 'disable' and name not in disabled:
+    active = {server.name for server in getattr(agent.mcp_runtime, 'servers', ())}
+    from .mcp_runtime import disabled_mcp_servers
+
+    elsewhere = disabled_mcp_servers(agent.runtime_config.cwd) - set(disabled)  # user or project settings
+    if verb == 'enable' and name in elsewhere:
+        return (f'MCP server {label} is turned off by disabledMcpServers in your user or project settings: '
+                'remove it there.')
+    # nothing to change: no settings write, no tool list change, so the prompt cache stays as it is
+    if verb == 'disable' and (name in disabled or name in elsewhere):
+        return f'MCP server {label} is already disabled.'
+    if verb == 'enable' and name in active:
+        return f'MCP server {label} is already enabled.'
+    if (verb == 'disable' and name not in active) or (verb == 'enable' and name not in disabled):
+        return f'Unknown MCP server: {label} (/mcp lists the configured servers)'
+    if verb == 'disable':
         disabled.append(name)
-    if verb == 'enable':
+    else:
         disabled = [item for item in disabled if item != name]
     payload['disabledMcpServers'] = disabled
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1492,8 +1617,21 @@ def _mcp_server_command(agent: 'LocalCodingAgent', verb: str, name: str) -> str:
     agent.mcp_runtime = MCPRuntime.from_workspace(
         agent.runtime_config.cwd, tuple(str(p) for p in agent.runtime_config.additional_working_directories))
     agent.tool_context = _replace(agent.tool_context, mcp_runtime=agent.mcp_runtime)
+    # the tool list changes with the next model call, no restart (--tools / --disallowed-tools still apply)
+    before = sum(1 for tool in agent.tool_registry if tool in agent._native_mcp_names)
+    agent.tool_registry = agent._apply_cli_tool_limits(agent._register_mcp_tools(agent.tool_registry))
+    after = sum(1 for tool in agent.tool_registry if tool in agent._native_mcp_names)
     agent.fire_config_change('local_settings', f'disabledMcpServers = {disabled}')
-    return f'{"Disabled" if verb == "disable" else "Enabled"} MCP server {name}'
+    changed = abs(after - before)
+    change = f'{changed} of its tools removed' if verb == 'disable' else f'{changed} tools added'
+    # names and counts only: never the server's command, env, headers or tokens
+    get_logger('mcp').info('/mcp %s %s: %d native tools %s; the next request writes the prompt cache again',
+                           verb, label, changed, 'removed' if verb == 'disable' else 'added')
+    note = ' The prompt cache is written again once.' if changed else ''
+    if verb == 'enable' and not changed:
+        note = ' It listed no tools yet: /mcp shows its status.'
+    return (f'{"Disabled" if verb == "disable" else "Enabled"} MCP server {label} '
+            f'({change}, from the next message).{note}')
 
 
 def _project_command(agent: 'LocalCodingAgent', kind: str) -> str | None:
@@ -1611,16 +1749,17 @@ def _handle_btw(agent: 'LocalCodingAgent', args: str, input_text: str) -> SlashC
     question = args.strip()
     if not question:
         return _local_result(input_text, 'Usage: /btw <question>')
-    messages = agent.last_session.to_openai_messages() if agent.last_session is not None else []
-    messages = list(messages) + [{'role': 'user', 'content': (
-        f'{question}\n\n(Side question: answer briefly from what you already know; do not call tools.)')}]
+    # The main loop's own tools, system prompt and messages plus the question, so the request reads
+    # the conversation's prompt cache; its usage and cost count in the session totals.
     try:
-        turn = agent.client.complete(messages, [])
+        text, _turn = agent.summary_completion(
+            f'{question}\n\n(Side question: answer briefly from what you already know.)')
     except Exception as exc:
         return _local_result(input_text, f'Side question failed: {exc}')
+    agent.save_side_totals()
     from .reasoning import split_reasoning
 
-    answer, _reasoning = split_reasoning(turn.content)
+    answer, _reasoning = split_reasoning(text)
     return _local_result(input_text, answer or '(no answer)')
 
 
@@ -1644,6 +1783,9 @@ def _handle_compact(agent: 'LocalCodingAgent', args: str, input_text: str) -> Sl
 
     custom_instructions = args.strip() if args.strip() else None
     result = compact_conversation(agent, custom_instructions, trigger='manual')
+    save = getattr(agent, 'save_side_totals', None)
+    if callable(save):
+        save()  # the summary's usage is in the totals now; keep it in the session file too
 
     if result.error:
         return _local_result(input_text, f'Compact failed: {result.error}')
@@ -1659,7 +1801,9 @@ def _handle_compact(agent: 'LocalCodingAgent', args: str, input_text: str) -> Sl
 
 def _handle_cost(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
     usage = agent.cumulative_usage
-    cost = agent.cumulative_cost_usd
+    from . import explicit_cache
+
+    cost = agent.cumulative_cost_usd + explicit_cache.storage_cost_usd()  # storage of explicit caches too
 
     def _fmt_cost(usd: float) -> str:
         if usd < 0.01:
@@ -1668,17 +1812,39 @@ def _handle_cost(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Slas
 
     lines = [
         f'Total cost:            {_fmt_cost(cost)}',
-        f'Total input tokens:    {usage.input_tokens:,}',
+        # prompt_tokens: input_tokens no longer holds cache reads and writes (they are split out)
+        f'Total input tokens:    {usage.prompt_tokens:,}',
         f'Total output tokens:   {usage.output_tokens:,}',
     ]
+    if usage.cache_read_input_tokens or usage.cache_creation_input_tokens:
+        lines.append(f'Uncached input tokens: {usage.input_tokens:,}')
     if usage.cache_read_input_tokens:
         lines.append(f'Cache read tokens:     {usage.cache_read_input_tokens:,}')
     if usage.cache_creation_input_tokens:
         lines.append(f'Cache creation tokens:  {usage.cache_creation_input_tokens:,}')
+    if usage.cache_creation_1h_input_tokens:
+        lines.append(f'  with the 1h TTL:      {usage.cache_creation_1h_input_tokens:,}')
+    lines += _explicit_cache_lines()  # after the 1h line, which belongs to "Cache creation tokens"
+    if usage.cache_read_input_tokens and usage.cache_hit_rate is not None:
+        lines.append(f'Cache hit rate:        {usage.cache_hit_rate:.0%}')
     if usage.reasoning_tokens:
         lines.append(f'Reasoning tokens:      {usage.reasoning_tokens:,}')
     lines.append(f'Total tokens:          {usage.total_tokens:,}')
+    lines += _side_call_lines(agent, _fmt_cost)
     return _local_result(input_text, '\n'.join(lines))
+
+
+def _side_call_lines(agent: 'LocalCodingAgent', fmt: Any = None) -> list[str]:
+    """One line for the model calls outside the main loop, which the totals above include."""
+    totals = getattr(agent, 'side_totals', None)
+    if not callable(totals):
+        return []
+    usage, cost, count = totals()
+    if not count:
+        return []
+    shown = fmt(cost) if fmt is not None else f'${cost:.4f}'
+    return [f'Side calls:            {count} ({shown}, {usage.total_tokens:,} tokens; summaries, /btw, hooks, '
+            'web_fetch prompts, subagents; included above)']
 
 
 def _handle_exit(agent: 'LocalCodingAgent', _args: str, input_text: str) -> SlashCommandResult:
@@ -1703,7 +1869,7 @@ def _handle_diff(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Slas
             ['git', 'diff'],
             cwd=cwd,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=15,
         )
         diff_output = proc.stdout.strip()
@@ -1713,7 +1879,7 @@ def _handle_diff(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Slas
                 ['git', 'diff', '--staged'],
                 cwd=cwd,
                 capture_output=True,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=15,
             )
             diff_output = proc_staged.stdout.strip()
@@ -1907,11 +2073,14 @@ def _handle_stats(agent: 'LocalCodingAgent', _args: str, input_text: str) -> Sla
         '',
         f'Messages:       {msg_count} total ({user_msgs} user, {assistant_msgs} assistant, {tool_msgs} tool)',
         f'Context (now):   {context_tokens:,} tokens',
-        f'Input (cumul.):  {usage.input_tokens:,} tokens (sum across all turns)',
+        f'Input (cumul.):  {usage.prompt_tokens:,} tokens (sum across all turns, cached included)',
         f'Output tokens:   {usage.output_tokens:,}',
-        f'Cost:            ${cost:.4f}',
+        f'Cost:            ${cost + _storage_cost():.4f}',
         f'Model:           {agent.model_config.model}',
     ]
+    lines += _cache_usage_lines(usage)
+    lines += _explicit_cache_lines()
+    lines += _side_call_lines(agent)
     if agent.active_session_id:
         lines.append(f'Session ID:    {agent.active_session_id}')
     return _local_result(input_text, '\n'.join(lines))

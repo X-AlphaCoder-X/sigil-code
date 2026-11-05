@@ -11,7 +11,7 @@ Closes #
 ## Checklist
 
 - [ ] The full test suite passes offline (`python -m pytest tests/`).
-- [ ] New behaviour has tests; a bug fix has a test that fails without the fix.
+- [ ] New behaviour has tests, and a bug fix has a test that fails without the fix.
 - [ ] Windows, Linux and macOS were considered if the change touches the shell, paths, processes or keyboard input.
 - [ ] `README.md` and `CHANGELOG.md` are updated for user-facing changes.
 - [ ] No new core dependencies, and no keys, tokens, personal data or local paths in the diff.

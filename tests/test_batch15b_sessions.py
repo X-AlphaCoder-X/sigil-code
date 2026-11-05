@@ -131,7 +131,8 @@ class SearchTests(Base):
         self.assertIn(f'resuming_session_id={target}', output)
         output.clear()
         _run_agent_chat_loop(self.agent(), initial_prompt=None, resume_session_id=None, show_transcript=False,
-                             input_func=scripted('/resume'), output_func=output.append)
+                             input_func=scripted('/resume all'), output_func=output.append)
+        # plain /resume lists the user's chat sessions only; /resume all lists -p and background ones, marked
         self.assertTrue(any('bg_0123456789ab  [bg]' in line for line in output), output)
         out = io.StringIO()
         picked: dict = {}

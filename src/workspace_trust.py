@@ -119,15 +119,9 @@ def _env_file_items(path: Path) -> list[TrustItem]:
     except OSError as _ignored:
         _log_ignored(_ignored)
         return []
-    items = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith('#') and '=' in line:
-            key, value = line.split('=', 1)
-            key = key.strip().removeprefix('export ').strip()
-            if key:
-                items.append(TrustItem('env', key, '', path.name, value.strip()))
-    return items
+    from .env_file import read_env_lines  # the same reading the loader uses, so trust matches it
+
+    return [TrustItem('env', key, '', path.name, value) for key, value in read_env_lines(text, path.name)]
 
 
 def _hook_items(hooks: Any, source: str) -> list[TrustItem]:
@@ -466,7 +460,7 @@ def report_skipped(cwd: str | Path, items: list[TrustItem] | None = None) -> Non
     _REPORTED.add(key)
     reason = 'skipped by the user' if state == 'skipped' else 'not trusted yet'
     message = (f'Sigil: project items in {_folder(cwd)} were not used ({reason}):\n{describe(items)}\n'
-               'Trust them with `sigil trust grant` (or /trust grant in a chat), '
+               'Trust them with `sigil trust grant` (or /trust grant in a chat, then restart Sigil), '
                'or set SIGIL_TRUST_ALL=1.')
     print(message, file=sys.stderr)
     from .debug_log import get_logger, sanitize_log

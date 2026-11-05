@@ -129,6 +129,11 @@ os.environ.setdefault('SIGIL_CLIPBOARD', 'off')
 os.environ.setdefault('SIGIL_NOTIFY', 'off')
 # No /models lookup at start-up: CLI tests feed fixed replies to a fake model server.
 os.environ.setdefault('SIGIL_DETECT_MODEL', '0')
+# A developer's .env (read by src.main at import) must not pick the model endpoint for tests:
+# CLI tests feed OpenAI-format replies to a fake server at the default local URL, and an
+# anthropic.com URL there would switch them to the native Messages API client.
+if os.environ.get('SIGIL_TEST_REAL_ENDPOINT', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
+    os.environ['OPENAI_BASE_URL'] = 'http://127.0.0.1:8000/v1'
 
 
 @pytest.fixture(autouse=True, scope='session')

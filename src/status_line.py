@@ -49,9 +49,41 @@ def status_payload(agent: Any) -> dict[str, Any]:
         'cwd': cwd,
         'model': {'id': model, 'display_name': model},
         'workspace': {'current_dir': cwd, 'project_dir': cwd},
-        'cost': {'total_cost_usd': float(getattr(agent, 'cumulative_cost_usd', 0.0) or 0.0)},
+        'cost': {'total_cost_usd': float(getattr(agent, 'cumulative_cost_usd', 0.0) or 0.0) + _storage_cost(),
+                 'side_cost_usd': _side_cost(agent),  # the part from summaries, hooks, subagents (included)
+                 'cache_storage_usd': _storage_cost()},  # explicit caches (Gemini, Vertex; included)
         'permission_mode': getattr(agent, 'permission_mode', 'default'),
+        'cache': _cache_payload(getattr(agent, 'cumulative_usage', None)),
     }
+
+
+def _storage_cost() -> float:
+    from .explicit_cache import storage_cost_usd
+
+    return round(storage_cost_usd(), 6)
+
+
+def _side_cost(agent: Any) -> float:
+    totals = getattr(agent, 'side_totals', None)
+    return float(totals()[1]) if callable(totals) else 0.0
+
+
+def _cache_payload(usage: Any) -> dict[str, Any]:
+    """Prompt cache numbers for the status line command: hit_rate is null until a prompt was sent."""
+    from .prompt_cache import current_settings
+
+    from .explicit_cache import live_caches
+
+    settings = current_settings()
+    explicit = live_caches()
+    if usage is None:
+        return {'mode': settings.mode, 'ttl': settings.ttl, 'hit_rate': None,
+                'read_tokens': 0, 'write_tokens': 0, 'write_1h_tokens': 0, 'explicit': explicit}
+    rate = usage.cache_hit_rate
+    return {'mode': settings.mode, 'ttl': settings.ttl,
+            'hit_rate': None if rate is None else round(rate, 4),
+            'read_tokens': usage.cache_read_input_tokens, 'write_tokens': usage.cache_creation_input_tokens,
+            'write_1h_tokens': usage.cache_creation_1h_input_tokens, 'explicit': explicit}
 
 
 class StatusLine:

@@ -256,5 +256,69 @@ class WorkerCleanupTests(unittest.TestCase):
         self.assertEqual(stopped, [1])
 
 
+class EndpointRoutingTests(unittest.TestCase):
+    """background_agent_start can route to another endpoint (e.g. NanoGPT/GLM) via
+    model@base_url or a base_url argument, without leaking the main key to that host."""
+
+    def _run(self, args: dict, env_extra: dict | None = None):
+        captured: dict[str, object] = {}
+
+        def _launch(self, command, **kwargs):  # noqa: ANN001
+            captured['command'] = command
+            captured['env'] = kwargs.get('env')
+            return _Record()
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch('src.background_runtime.BackgroundSessionRuntime.launch', _launch):
+            agent = make_agent(Path(tmp))
+            with patch.dict(os.environ, env_extra or {}, clear=False):
+                execute_tool(agent.tool_registry, 'background_agent_start', args, agent.tool_context)
+        return captured
+
+    def test_model_at_url_routes_base_url_and_forwards_host_key(self) -> None:
+        cap = self._run(
+            {'prompt': 'x', 'model': 'glm@https://nano-gpt.com/api/v1'},
+            {'SIGIL_API_KEY_NANO_GPT_COM': 'nano-secret'},
+        )
+        command = cap['command']
+        base = command[command.index('--base-url') + 1]
+        model = command[command.index('--model') + 1]
+        self.assertEqual(base, 'https://nano-gpt.com/api/v1')
+        self.assertEqual(model, 'glm')  # the @url is stripped from the model name
+        env = cap['env']
+        self.assertEqual(env['SIGIL_API_KEY_NANO_GPT_COM'], 'nano-secret')
+        self.assertEqual(env['OPENAI_API_KEY'], 'nano-secret')
+
+    def test_model_with_at_but_no_url_stays_a_model_name(self) -> None:
+        cap = self._run({'prompt': 'x', 'model': 'claude-3-5-sonnet@20240620'})
+        command = cap['command']
+        self.assertEqual(command[command.index('--model') + 1], 'claude-3-5-sonnet@20240620')
+        self.assertNotIn('20240620', command[command.index('--base-url') + 1])
+
+    def test_non_http_base_url_is_refused(self) -> None:
+        cap = self._run({'prompt': 'x', 'base_url': 'file:///etc/passwd'})
+        self.assertNotIn('command', cap)  # nothing was launched
+
+    def test_base_url_argument_routes_endpoint(self) -> None:
+        cap = self._run(
+            {'prompt': 'x', 'model': 'glm', 'base_url': 'https://nano-gpt.com/api/v1'},
+            {'SIGIL_API_KEY_NANO_GPT_COM': 'nano-secret'},
+        )
+        command = cap['command']
+        self.assertEqual(command[command.index('--base-url') + 1], 'https://nano-gpt.com/api/v1')
+        self.assertEqual(command[command.index('--model') + 1], 'glm')
+
+    def test_other_host_without_key_does_not_leak_main_key(self) -> None:
+        # The parent's key is for its own host; another host gets 'local-token', not the main key.
+        cap = self._run(
+            {'prompt': 'x', 'model': 'glm@https://nano-gpt.com/api/v1'},
+            # blank the host/brand keys so a real .env key cannot satisfy the lookup
+            {'OPENAI_API_KEY': 'MAIN-KEY-DO-NOT-LEAK', 'SIGIL_API_KEY_NANO_GPT_COM': '', 'SIGIL_API_KEY': ''},
+        )
+        env = cap['env']
+        self.assertNotEqual(env['OPENAI_API_KEY'], 'MAIN-KEY-DO-NOT-LEAK')
+        self.assertEqual(env['SIGIL_API_KEY_NANO_GPT_COM'], 'local-token')
+
+
 if __name__ == '__main__':
     unittest.main()

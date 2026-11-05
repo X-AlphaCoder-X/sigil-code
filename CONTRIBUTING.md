@@ -20,7 +20,7 @@ Search the [open issues](https://github.com/X-AlphaCoder-X/sigil-code/issues) fi
 - what happened and what you expected,
 - the steps to reproduce it, ideally with the smallest prompt or command that shows it,
 - your Sigil version (`sigil --version`), OS, Python version, and the model and provider you used,
-- the relevant log lines. Errors are always logged to `~/.sigil/logs`; run with `--debug` to also log the request and response bodies.
+- the relevant log lines. Errors are always logged to `~/.sigil/logs`. Run with `--debug` to also log the request and response bodies.
 
 Remove API keys and anything private from logs before you paste them. Sigil redacts known key formats, but check anyway.
 
@@ -35,7 +35,7 @@ pip install -e ".[dev]"      # or ".[all,dev]" to pull in the optional extras to
 python -m pytest tests/
 ```
 
-The suite has 1,476 tests in 102 files. It runs fully offline against a fake local model server, so you don't need an API key, a GPU or a network connection. The same tests run in CI (`.github/workflows/tests.yml`) on Linux and Windows with Python 3.10 and 3.12, on every pull request.
+The suite has 1,728 tests in 123 files. It runs fully offline against a fake local model server, so you don't need an API key, a GPU or a network connection. The same tests run in CI (`.github/workflows/tests.yml`) on Linux and Windows with Python 3.10 and 3.12, on every pull request.
 
 To try your change by hand without reinstalling:
 
@@ -67,7 +67,7 @@ python -m src.main agent-chat --allow-write --allow-shell
 ## Code guidelines
 
 - Match the code around your change: its naming, comment density and structure. Small, readable functions with type hints are the norm.
-- Use the standard library where it does the job. Don't add new core dependencies. Right now there are two (`prompt_toolkit`, `rich`); anything optional goes behind an extra in `pyproject.toml`.
+- Use the standard library where it does the job. Don't add new core dependencies. Right now there are two (`prompt_toolkit`, `rich`), and anything optional goes behind an extra in `pyproject.toml`.
 - Every fix or feature gets a test, and a bug fix gets a test that fails without the fix. Tests must stay offline: use the fake model server, temporary folders and localhost, never real endpoints or your own files.
 - Never swallow an error silently. Log it, or report it to the user plainly.
 - Respect the user's settings. Anything that writes files or runs commands must go through the write and shell permissions, plan mode and the permission rules, the same way the existing tools do. A safety limit you add needs a documented env var or setting to change it.
@@ -95,7 +95,7 @@ SigilTool(
 
 The handler takes `(arguments, context)` and returns the result text, or `(text, metadata)`. Keep `parameters` a JSON schema with `'type': 'object'`, because strict providers reject anything else. If the tool writes files or runs commands, make sure it respects the write/shell permissions and plan mode, the same way the existing tools do.
 
-**Custom tool (no core changes).** Put a Python file in `src/custom_tools/`. The file name becomes the tool name. You can optionally set module-level `name`, `description` and `parameters`. The handler is the `handler` function if there is one, and otherwise the first public callable in the file. A tool in a repository's `src/custom_tools/` is imported (and so runs) only after you trust the folder (see Folder trust in the README); your own `~/.sigil/custom_tools/` always load. A custom tool may not take a built-in tool's name or shadow one of your own tools; such a file is refused with a note on stderr:
+**Custom tool (no core changes).** Put a Python file in `src/custom_tools/`. The file name becomes the tool name. You can optionally set module-level `name`, `description` and `parameters`. The handler is the `handler` function if there is one, and otherwise the first public callable in the file. A tool in a repository's `src/custom_tools/` is imported (and so runs) only after you trust the folder (see Folder trust in the README), while your own `~/.sigil/custom_tools/` always load. A custom tool may not take a built-in tool's name or shadow one of your own tools. Such a file is refused with a note on stderr:
 
 ```python
 # src/custom_tools/word_count.py

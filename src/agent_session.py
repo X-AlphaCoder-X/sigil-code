@@ -51,6 +51,11 @@ class AgentMessage:
             # Messages API reply blocks with thinking; anthropic_client sends them back unchanged,
             # the OpenAI-compatible client drops the key.
             payload['anthropic_content'] = [dict(block) for block in original if isinstance(block, dict)]
+        replay = self.metadata.get('provider_replay') if isinstance(self.metadata, dict) else None
+        if self.role == 'assistant' and isinstance(replay, dict) and replay:
+            # reasoning_content / tool-call extra_content of an OpenAI-compatible reply; the client
+            # sends them back only to the endpoint that wrote them (thinking_replay.prepare)
+            payload['provider_replay'] = dict(replay)
         return payload
 
     def to_transcript_entry(self) -> JSONDict:
@@ -305,6 +310,16 @@ class AgentSessionState:
         message = self.messages[index]
         metadata = dict(message.metadata)
         metadata['anthropic_content'] = [dict(block) for block in content]
+        self.messages[index] = replace(message, metadata=metadata)
+
+    def set_assistant_replay(self, index: int, replay: JSONDict | None) -> None:
+        """Keep what an OpenAI-compatible reply needs sent back later (reasoning_content, thought
+        signatures) with its assistant message."""
+        if not replay or not (0 <= index < len(self.messages)):
+            return
+        message = self.messages[index]
+        metadata = dict(message.metadata)
+        metadata['provider_replay'] = dict(replay)
         self.messages[index] = replace(message, metadata=metadata)
 
     def finalize_assistant(
@@ -601,6 +616,7 @@ def _usage_from_payload(payload: Any) -> UsageStats:
         cache_creation_input_tokens=_as_int('cache_creation_input_tokens'),
         cache_read_input_tokens=_as_int('cache_read_input_tokens'),
         reasoning_tokens=_as_int('reasoning_tokens'),
+        cache_creation_1h_input_tokens=_as_int('cache_creation_1h_input_tokens'),
     )
 
 

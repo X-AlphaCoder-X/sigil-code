@@ -59,7 +59,9 @@ class ThinkingTests(unittest.TestCase):
             self.assertEqual(payload('claude-sonnet-5', 'off')['thinking'], {'type': 'disabled'})
             self.assertEqual(payload('claude-sonnet-5-5', 'off')['thinking'], {'type': 'between_tools'})
             cannot = payload('claude-opus-5-5', 'off')  # cannot be turned off: lowest effort
-            self.assertEqual((cannot['thinking'], cannot['output_config']), ({'type': 'adaptive'}, {'effort': 'low'}))
+            # Claude 5.1+ also carries block_binding (thinking_replay.py)
+            self.assertEqual((cannot['thinking'], cannot['output_config']),
+                             ({'type': 'adaptive', 'block_binding': {'prefix_mismatch_behavior': 'drop_block'}}, {'effort': 'low'}))
             self.assertEqual(payload('claude-sonnet-4-5', 'high')['thinking'], {'type': 'enabled', 'budget_tokens': 16000})
             on = payload('claude-sonnet-5', 'high')
             self.assertEqual((on['thinking'], on['output_config']), ({'type': 'adaptive'}, {'effort': 'high'}))

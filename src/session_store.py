@@ -50,7 +50,7 @@ def save_session(session: StoredSession, directory: Path | None = None) -> Path:
 def load_session(session_id: str, directory: Path | None = None) -> StoredSession:
     _validate_session_id(session_id)
     target_dir = directory or DEFAULT_SESSION_DIR
-    data = json.loads((target_dir / f'{session_id}.json').read_text())
+    data = json.loads((target_dir / f'{session_id}.json').read_text(encoding='utf-8'))
     return StoredSession(
         session_id=data['session_id'],
         messages=tuple(data['messages']),
@@ -83,6 +83,18 @@ class StoredAgentSession:
     scratchpad_directory: str | None = None
     current_turn: int = 0
     file_access_history: JSONDict = field(default_factory=dict)
+    # Model calls outside the main loop (/btw, summaries, compaction, hooks, the web_fetch prompt,
+    # subagents, the editor): kept apart from `usage` / `total_cost_usd` and written whole each
+    # time (never added to), so a resume or a second save cannot count them twice.
+    side_usage: JSONDict = field(default_factory=dict)
+    side_cost_usd: float = 0.0
+    side_call_count: int = 0
+    # Explicit cache storage (Gemini, Vertex) counted for this session, written whole each time and
+    # restored on resume (explicit_cache.adopt_session_storage); sessions saved before have none (0).
+    cache_storage_usd: float = 0.0
+    # How the session was started: chat (the user, in a chat), print (-p), background (a background agent);
+    # empty for sessions saved before this was recorded. /resume and -c show the user's own sessions.
+    origin: str = ''
 
 
 def _ignore_in_git(folder: Path) -> None:
@@ -110,8 +122,40 @@ def save_agent_session(session: StoredAgentSession, directory: Path | None = Non
             return str(obj)
         raise TypeError(f"Object of type {obj.__class__.__name__} is not JSON serializable")
 
-    write_text_atomic(path, json.dumps(asdict(session), indent=2, default=path_serializer))
+    data = asdict(session)
+    # origin right after session_id, near the top of the file, so a session list can read it cheaply
+    data = {'session_id': data.pop('session_id'), 'origin': data.pop('origin', ''), **data}
+    write_text_atomic(path, json.dumps(data, indent=2, default=path_serializer))
     return path
+
+
+_ORIGIN_RE = None
+
+
+def session_origin(directory: Path, session_id: str) -> str:
+    """How a saved session was started (chat, print, background), from the top of its file; '' when it was
+    saved before this was recorded or cannot be read (logged)."""
+    global _ORIGIN_RE
+    import re
+
+    if _ORIGIN_RE is None:
+        _ORIGIN_RE = re.compile(r'"origin":\s*"([a-z]{0,16})"')
+    try:
+        with open(Path(directory) / f'{session_id}.json', encoding='utf-8') as handle:
+            head = handle.read(2048)
+    except (OSError, ValueError) as _ignored:  # ValueError: a file that is not UTF-8
+        _log_ignored(_ignored)
+        return ''
+    match = _ORIGIN_RE.search(head)
+    return match.group(1) if match else ''
+
+
+def is_user_session(directory: Path, session_id: str) -> bool:
+    """A session the user started in a chat. Background (bg_*) and subagent (--sub--) sessions and -p runs
+    are not; a session saved before the origin was recorded counts as the user's (it cannot be told apart)."""
+    if session_id.startswith('bg_') or '--sub--' in session_id or session_id == 'session_backup':
+        return False
+    return session_origin(directory, session_id) in ('', 'chat')
 
 
 def load_agent_session(session_id: str, directory: Path | None = None) -> StoredAgentSession:
@@ -186,6 +230,11 @@ def load_agent_session(session_id: str, directory: Path | None = None) -> Stored
         file_hashes=dict(data.get('file_hashes', {})),
         current_turn=int(data.get('current_turn', 0)),
         file_access_history=dict(data.get('file_access_history', {})),
+        side_usage=dict(data.get('side_usage') or {}) if isinstance(data.get('side_usage'), dict) else {},
+        side_cost_usd=_optional_float(data.get('side_cost_usd')) or 0.0,
+        side_call_count=_optional_int(data.get('side_call_count')) or 0,
+        cache_storage_usd=max(0.0, _optional_float(data.get('cache_storage_usd')) or 0.0),
+        origin=str(data.get('origin') or '') if isinstance(data.get('origin'), str) else '',
     )
 
 
@@ -278,6 +327,7 @@ def purge_agent_sessions(directory: Path, *, older_than_days: float | None, dry_
             continue
         (directory / f'{session_id}.json').unlink(missing_ok=True)
         (directory / 'notes' / f'{session_id}.md').unlink(missing_ok=True)
+        (directory / 'loops' / f'{session_id}.json').unlink(missing_ok=True)  # its scheduled prompts
         shutil.rmtree(directory / 'checkpoints' / session_id, ignore_errors=True)
     if removed and not dry_run:
         try:
@@ -370,6 +420,8 @@ def serialize_model_config(model_config: ModelConfig) -> JSONDict:
             'output_cost_per_million_tokens_usd': model_config.pricing.output_cost_per_million_tokens_usd,
             'cache_creation_input_cost_per_million_tokens_usd': model_config.pricing.cache_creation_input_cost_per_million_tokens_usd,
             'cache_read_input_cost_per_million_tokens_usd': model_config.pricing.cache_read_input_cost_per_million_tokens_usd,
+            'cache_creation_1h_input_cost_per_million_tokens_usd': (
+                model_config.pricing.cache_creation_1h_input_cost_per_million_tokens_usd),
         },
     }
 
@@ -494,6 +546,8 @@ def usage_from_payload(payload: JSONDict | None) -> UsageStats:
         cache_creation_input_tokens=_optional_int(payload.get('cache_creation_input_tokens')) or 0,
         cache_read_input_tokens=_optional_int(payload.get('cache_read_input_tokens')) or 0,
         reasoning_tokens=_optional_int(payload.get('reasoning_tokens')) or 0,
+        # sessions saved before 1.1.0 have no such key: 0
+        cache_creation_1h_input_tokens=_optional_int(payload.get('cache_creation_1h_input_tokens')) or 0,
     )
 
 
@@ -509,6 +563,10 @@ def _deserialize_pricing(payload: Any) -> ModelPricing:
         ),
         cache_read_input_cost_per_million_tokens_usd=(
             _optional_float(payload.get('cache_read_input_cost_per_million_tokens_usd'))
+            or 0.0
+        ),
+        cache_creation_1h_input_cost_per_million_tokens_usd=(
+            _optional_float(payload.get('cache_creation_1h_input_cost_per_million_tokens_usd'))
             or 0.0
         ),
     )

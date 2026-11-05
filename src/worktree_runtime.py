@@ -374,7 +374,7 @@ def _find_git_common_dir(cwd: Path) -> Path | None:
             ['git', '-C', str(cwd), 'rev-parse', '--git-common-dir'],
             check=True,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as _ignored:
@@ -397,7 +397,7 @@ def _infer_repo_root(cwd: Path, common_git_dir: Path | None) -> Path | None:
             ['git', '-C', str(cwd), 'rev-parse', '--show-toplevel'],
             check=True,
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError) as _ignored:
@@ -478,7 +478,7 @@ def _run_git(repo_root: Path, arguments: list[str], *, check: bool = True) -> su
         ['git', '-C', str(repo_root), *arguments],
         check=check,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=_git_timeout(),
         env={**os.environ, 'GIT_TERMINAL_PROMPT': '0'},
     )
@@ -506,7 +506,7 @@ def _count_worktree_changes(worktree_path: Path, original_head_commit: str | Non
         ['git', '-C', str(worktree_path), 'status', '--porcelain'],
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=_git_timeout(),
     )
     if status.returncode != 0:
@@ -518,7 +518,7 @@ def _count_worktree_changes(worktree_path: Path, original_head_commit: str | Non
         ['git', '-C', str(worktree_path), 'rev-list', '--count', f'{original_head_commit}..HEAD'],
         check=False,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=_git_timeout(),
     )
     if rev_list.returncode != 0:

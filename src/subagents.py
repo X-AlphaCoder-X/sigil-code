@@ -203,7 +203,10 @@ def apply_definition_extras(parent: Any, definition: SubagentDefinition, tools: 
         errors: list[str] = []
         parsed = _parse_hooks(definition.hooks, f'agent:{definition.name}', errors)
         base = hooks if hooks is not None else CommandHookRuntime(cwd=parent.runtime_config.cwd)
-        hooks = _replace(base, hooks=(*base.hooks, *parsed), load_errors=(*base.load_errors, *errors))
+        # fixed_hooks: the agent's own hooks stay when the settings files are re-read (command_hooks.refresh)
+        hooks = _replace(base, hooks=(*base.hooks, *parsed), load_errors=(*base.load_errors, *errors),
+                         fixed_hooks=(*base.fixed_hooks, *parsed), fixed_errors=(*base.fixed_errors, *errors))
+        hooks._signature = getattr(base, '_signature', None)
     return {'tools': tools, 'prompt': '\n\n'.join(parts), 'hooks': hooks}
 
 

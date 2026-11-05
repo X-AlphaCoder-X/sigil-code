@@ -82,6 +82,9 @@ def run_editor(agent: Any, instructions: str) -> tuple[str, dict[str, Any]]:
     if getattr(agent, 'permission_mode', 'default') not in ('plan',):
         editor.permission_mode = getattr(agent, 'permission_mode', 'default')
     result = editor.run(instructions)
+    record = getattr(agent, '_record_child_run', None)
+    if callable(record):
+        record(editor)  # the editor's model calls count in the session totals
     changed = sorted({str((entry.get('arguments') or {}).get('path'))
                       for entry in (result.tool_execution_ledger or ())
                       if isinstance(entry, dict) and entry.get('tool_name') in EDIT_TOOLS and entry.get('ok')

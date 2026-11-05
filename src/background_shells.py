@@ -268,8 +268,13 @@ def kill_process_tree(process: subprocess.Popen[Any], win_job: Any = None) -> No
     if process.poll() is not None:
         return
     if sys.platform == 'win32':
-        subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
-                       capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            # timeout: a hung taskkill must not block the stop path forever
+            subprocess.run(['taskkill', '/PID', str(process.pid), '/T', '/F'],
+                           capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW,
+                           timeout=10)
+        except (OSError, subprocess.SubprocessError) as _tk_ignored:
+            _log_ignored(_tk_ignored)
     else:
         from .process_group import safe_killpg
 

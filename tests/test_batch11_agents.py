@@ -203,7 +203,8 @@ class AnthropicExtraTests(unittest.TestCase):
             schema = Path(tmp) / 's.json'
             schema.write_text(json.dumps({'type': 'object'}), encoding='utf-8')
             err = io.StringIO()
-            with patch('sys.stderr', err), patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': ''}):
+            # the compat endpoint is now opt-in (native is the default for anthropic.com)
+            with patch('sys.stderr', err), patch.dict(os.environ, {'SIGIL_ANTHROPIC_NATIVE': '0'}):
                 _build_agent(build_parser().parse_args([
                     'agent', 'x', '--cwd', tmp, '--base-url', 'https://api.anthropic.com/v1',
                     '--model', 'claude-x', '--response-schema-file', str(schema)]))

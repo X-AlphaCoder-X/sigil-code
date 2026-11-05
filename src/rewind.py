@@ -146,12 +146,35 @@ def summarize_session(agent: Any, stored: Any, match: PromptPoint, mode: str,
     chunk = messages[start:end]
     if not chunk:
         raise ValueError('Nothing to summarize there. Pick another prompt.')
-    rendered = _render_transcript([AgentMessage.from_openai_message(m) for m in chunk])
-    request = [{'role': 'user', 'content': (
-        'Below is part of a conversation to summarize.\n\n<transcript>\n' + rendered + '\n</transcript>\n\n'
-        + get_compact_prompt(instructions))}]
-    turn = fast_client(agent.model_config, default=agent.client).complete(request, tools=[])
-    summary = format_compact_summary(getattr(turn, 'content', None) or '')
+    client = fast_client(agent.model_config, default=agent.client)
+    text = ''
+    summary_completion = getattr(agent, 'summary_completion', None)
+    if callable(summary_completion):
+        # the whole conversation as the main loop sends it (so the request reads its prompt cache),
+        # and which part to summarize in words
+        from .agent_session import AgentSessionState
+
+        session = AgentSessionState.from_persisted(
+            system_prompt_parts=stored.system_prompt_parts, user_context=stored.user_context,
+            system_context=stored.system_context, messages=stored.messages)
+        anchor = ' '.join(match.text.split())[:120]
+        part = (f'Summarize only the part of the conversation that starts at the user message "{anchor}" '
+                'and runs to the end.' if mode == 'summarize-from' else
+                f'Summarize only the part of the conversation before the user message "{anchor}"; that '
+                'message and everything after it stay word for word.')
+        text, _turn = summary_completion(part + '\n\n' + get_compact_prompt(instructions), session=session,
+                                         client=client)
+    if not text.strip():
+        rendered = _render_transcript([AgentMessage.from_openai_message(m) for m in chunk])
+        request = [{'role': 'user', 'content': (
+            'Below is part of a conversation to summarize.\n\n<transcript>\n' + rendered + '\n</transcript>\n\n'
+            + get_compact_prompt(instructions))}]
+        turn = client.complete(request, tools=[])
+        record = getattr(agent, 'record_side_usage', None)
+        if callable(record):
+            record(turn.usage, client=client)
+        text = getattr(turn, 'content', None) or ''
+    summary = format_compact_summary(text)
     if not summary.strip():
         raise ValueError('The model returned an empty summary; nothing was changed.')
     where = f'from prompt #{match.number} onward' if mode == 'summarize-from' else f'before prompt #{match.number}'
@@ -163,7 +186,8 @@ def summarize_session(agent: Any, stored: Any, match: PromptPoint, mode: str,
         'metadata': {'kind': 'compact_summary', 'is_compact_summary': True, 'summarized': mode},
     }
     kept = messages[:start] + [summary_message] + messages[end:]
-    save_agent_session(replace(stored, messages=tuple(kept)), directory=agent.runtime_config.session_directory)
+    side = agent._side_fields(stored.session_id) if hasattr(agent, '_side_fields') else {}
+    save_agent_session(replace(stored, messages=tuple(kept), **side), directory=agent.runtime_config.session_directory)
     agent.last_session = None
     model = agent.model_config.model
     before = sum(estimate_tokens(str(m.get('content') or ''), model) for m in chunk)

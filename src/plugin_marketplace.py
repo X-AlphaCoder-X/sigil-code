@@ -159,7 +159,7 @@ def _git(*args: str, cwd: Path | None = None, restrict: bool = False) -> str:
                   '-c', 'protocol.ssh.allow=always', '-c', 'protocol.http.allow=always',
                   '-c', 'protocol.git.allow=always']
         env = {**os.environ, 'GIT_PROTOCOL_FROM_USER': '0', 'GIT_TERMINAL_PROMPT': '0'}
-    result = subprocess.run(['git', *config, *args], cwd=cwd, capture_output=True, text=True, timeout=300, env=env)
+    result = subprocess.run(['git', *config, *args], cwd=cwd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, env=env)
     if result.returncode != 0:
         raise RuntimeError(f'git {" ".join(args[:2])} failed: {result.stderr.strip()[:400]}')
     return result.stdout.strip()

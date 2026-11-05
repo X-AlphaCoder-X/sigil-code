@@ -178,6 +178,11 @@ def save_combined_report(reports: list[SuiteReport], path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # the tables use box-drawing characters: write UTF-8 even when the output is a file or pipe
+    # (on Windows those default to the ANSI code page, and the first table line raised UnicodeEncodeError)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(
         description="Run standard evaluation benchmarks against Sigil Code",
         formatter_class=argparse.RawDescriptionHelpFormatter,

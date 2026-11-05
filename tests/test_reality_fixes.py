@@ -982,7 +982,10 @@ class BashStreamCapTests(unittest.TestCase):
 
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop('SIGIL_BASH_STREAM_MAX_CHARS', None)
+            # default caps at ~60k tokens (240,000 chars) but never below the configured per-tool size
             self.assertEqual(_bash_stream_cap(12000), 120000)
+            self.assertEqual(_bash_stream_cap(50000), 240000)  # ceiling
+            self.assertEqual(_bash_stream_cap(300000), 300000)  # never below the output limit
             os.environ['SIGIL_BASH_STREAM_MAX_CHARS'] = '0'
             self.assertEqual(_bash_stream_cap(12000), 0)  # 0 = no cap
 

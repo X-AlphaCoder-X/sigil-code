@@ -267,6 +267,11 @@ def save_results(results: list[TaskResult], output_path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # the results table uses box-drawing characters: write UTF-8 even when the output is a file or pipe
+    # (on Windows those default to the ANSI code page, and the first table line raised UnicodeEncodeError)
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="Sigil Code local benchmark")
     parser.add_argument("--task", help="Run a single task by ID")
     parser.add_argument("--category", help="Run tasks in a category")

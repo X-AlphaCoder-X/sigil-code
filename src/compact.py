@@ -401,62 +401,33 @@ def compact_conversation(
 
     # ---- Build the compact request messages ----
     compact_prompt = get_compact_prompt(custom_instructions)
+    from .anthropic_client import fast_client
 
-    # We send the system prompt + candidate messages + the compact prompt as
-    # a user message.  The model returns the summary.
-    api_messages: list[dict[str, Any]] = []
+    # The session's own client unless a fast model is set for side jobs.
+    client = fast_client(agent.model_config, default=agent.client)
 
-    # System prompt (from session)
-    for part in session.system_prompt_parts:
-        if part.strip():
-            api_messages.append({'role': 'system', 'content': part})
-
-    # Candidate messages (the ones to be summarised), flattened to plain text.
-    # Sending raw tool_calls/tool messages with tools=[] is rejected by some
-    # backends (e.g. Anthropic: tool_use blocks require tool definitions), and
-    # mid-conversation system messages are not accepted everywhere either.
-    api_messages.append({
-        'role': 'user',
-        'content': (
-            'Below is the conversation transcript to summarize.\n\n'
-            '<transcript>\n' + _render_transcript(candidates) + '\n</transcript>\n\n'
-            + compact_prompt
-        ),
-    })
-
-    # ---- Call the model ----
-    # Send the full transcript; only if the API reports the
-    # prompt is too long, drop the oldest messages and retry.
-    dropped = 0
-    attempts = 0
-    while True:
+    # First the request that reads the main conversation's prompt cache: the main loop's own tools,
+    # system prompt and messages, plus the compact prompt (agent.summary_completion). Only when that
+    # does not fit, or brings no text, the conversation is sent as one plain-text transcript.
+    turn = None
+    summary_completion = getattr(agent, 'summary_completion', None)
+    if callable(summary_completion):
         try:
-            from .anthropic_client import fast_client
-
-            # The session's own client unless a fast model is set for side jobs.
-            turn = fast_client(agent.model_config, default=agent.client).complete(api_messages, tools=[])
-            break
+            text, turn = summary_completion(compact_prompt, session=session, client=client)
+            if not text.strip():
+                turn = None
         except Exception as exc:
-            attempts += 1
-            remaining = len(candidates) - dropped
-            if attempts > _PTL_MAX_DROP_RETRIES or not _is_prompt_too_long(exc) or remaining < 2:
+            if not _is_prompt_too_long(exc):
                 return CompactionResult(
                     boundary_message=_build_boundary(f'Compact API call failed: {exc}'),
                     error=str(exc),
                 )
-            dropped += max(remaining // 5, 1)
-            while dropped < len(candidates) - 1 and candidates[dropped].role == 'tool':
-                dropped += 1
-            api_messages[-1] = {
-                'role': 'user',
-                'content': (
-                    'Below is the conversation transcript to summarize. The oldest '
-                    f'{dropped} messages were omitted because the full transcript '
-                    'exceeded the context window.\n\n'
-                    '<transcript>\n' + _render_transcript(candidates[dropped:]) + '\n</transcript>\n\n'
-                    + compact_prompt
-                ),
-            }
+            turn = None
+    if turn is None:
+        turn, error = _compact_from_transcript(agent, client, session, candidates, compact_prompt)
+        if turn is None:
+            return CompactionResult(boundary_message=_build_boundary(f'Compact API call failed: {error}'),
+                                    error=str(error))
 
     # [TYPE-SAFETY] Use getattr to guard against AttributeError if the client
     # returns an unexpected object (backend outage, version mismatch).
@@ -659,6 +630,50 @@ def _is_prompt_too_long(exc: Exception) -> bool:
         'maximum context', 'too many tokens', 'input is too long', 'context window',
     ))
 
+
+def _compact_from_transcript(agent: Any, client: Any, session: Any, candidates: list[AgentMessage],
+                             compact_prompt: str) -> tuple[Any, Exception | None]:
+    """The older request: the messages to summarize as one plain-text transcript, no tools. Used
+    when the cached request is too long or brings no text. Drops the oldest messages and tries
+    again while the API says the prompt is too long. Returns (turn, None) or (None, error)."""
+    api_messages: list[dict[str, Any]] = [{'role': 'system', 'content': part}
+                                          for part in session.system_prompt_parts if part.strip()]
+    api_messages.append({
+        'role': 'user',
+        'content': (
+            'Below is the conversation transcript to summarize.\n\n'
+            '<transcript>\n' + _render_transcript(candidates) + '\n</transcript>\n\n'
+            + compact_prompt
+        ),
+    })
+    dropped = 0
+    attempts = 0
+    record = getattr(agent, 'record_side_usage', None)
+    while True:
+        try:
+            turn = client.complete(api_messages, tools=[])
+        except Exception as exc:
+            attempts += 1
+            remaining = len(candidates) - dropped
+            if attempts > _PTL_MAX_DROP_RETRIES or not _is_prompt_too_long(exc) or remaining < 2:
+                return None, exc
+            dropped += max(remaining // 5, 1)
+            while dropped < len(candidates) - 1 and candidates[dropped].role == 'tool':
+                dropped += 1
+            api_messages[-1] = {
+                'role': 'user',
+                'content': (
+                    'Below is the conversation transcript to summarize. The oldest '
+                    f'{dropped} messages were omitted because the full transcript '
+                    'exceeded the context window.\n\n'
+                    '<transcript>\n' + _render_transcript(candidates[dropped:]) + '\n</transcript>\n\n'
+                    + compact_prompt
+                ),
+            }
+            continue
+        if callable(record):
+            record(getattr(turn, 'usage', None) or UsageStats(), client=client)
+        return turn, None
 
 def _render_transcript(messages: list[AgentMessage]) -> str:
     """Render messages as plain text so any backend accepts the summary request.

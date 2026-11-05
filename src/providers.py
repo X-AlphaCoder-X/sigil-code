@@ -89,11 +89,11 @@ def detect_provider(base_url: str, model: str = '') -> str:
     parsed = urllib.parse.urlparse(base_url or '')
     host = (parsed.hostname or '').lower()
     port = parsed.port
-    if host.endswith('anthropic.com'):
+    if host == 'anthropic.com' or host.endswith('.anthropic.com'):
         return 'anthropic'
-    if host.endswith('openrouter.ai'):
+    if host == 'openrouter.ai' or host.endswith('.openrouter.ai'):
         return 'openrouter'
-    if host.endswith('openai.com'):
+    if host == 'openai.com' or host.endswith('.openai.com'):
         return 'openai'
     if 'ollama' in host or port == 11434:
         return 'ollama'
@@ -104,6 +104,21 @@ def detect_provider(base_url: str, model: str = '') -> str:
     if 'vllm' in host or port == 8000:
         return 'vllm'
     return 'openai-compatible'
+
+
+def prompt_cache_control() -> dict[str, str]:
+    """The cache_control block for this session's TTL (prompt_cache.py: SIGIL_PROMPT_CACHE_TTL,
+    the promptCache setting or /cache)."""
+    from .prompt_cache import current_settings
+
+    return {'type': 'ephemeral', 'ttl': '1h'} if current_settings().ttl in ('1h', '24h') else {'type': 'ephemeral'}
+
+
+def prompt_cache_markers(base_url: str, model: str = '', *, native: bool = False) -> bool:
+    """Whether cache_control markers go on this request (prompt_cache.plan_for decides per provider)."""
+    from .prompt_cache import plan_for
+
+    return plan_for(base_url, model, native=native).markers
 
 
 def _model_family(model: str) -> str:

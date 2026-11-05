@@ -15,6 +15,8 @@ from typing import Callable
 from .debug_log import log_ignored_error as _log_ignored  # handled errors still reach the log file
 
 QUEUED_MESSAGE_KIND = 'queued_user_message'
+# Keys read in one poll at or above this count are a paste, not typing.
+_PASTE_BURST_CHARS = 16
 
 
 class MessageQueue:
@@ -155,7 +157,7 @@ class ConsoleInputReader:
             if self._win_console:
                 self._hide_cursor()
             self._write('\033[?25l' + clear + done + '\n'
-                        + '\u270e ' + ''.join(self._buffer) + self._park_cursor() + '\033[?25h')
+                        + '\u270e ' + self._shown() + self._park_cursor() + '\033[?25h')
             if self._win_console:
                 # The pencil glyph's actual screen row, not character math
                 # (the pencil is 2 cells wide on some consoles).
@@ -292,10 +294,15 @@ class ConsoleInputReader:
         """Stop reading. Returns any partially typed (not yet submitted) text."""
         self._stop.set()
         if self._thread is not None:
-            self._thread.join(timeout=1.0)
+            self._thread.join(timeout=5.0)
+            # Why: reading keys here while the thread still reads them split a paste
+            # between the two, so characters went missing or showed up later.
+            if self._win_console and not self._thread.is_alive():
+                self._drain_console_keys()
             self._thread = None
         with self._lock:
-            partial = ''.join(self._buffer)
+            partial = getattr(self, '_paused_draft', '') + ''.join(self._buffer)
+            self._paused_draft = ''
             self._buffer = []
             if partial:
                 # Erase the typed line instead of leaving it stranded above the
@@ -305,6 +312,47 @@ class ConsoleInputReader:
             self._flush_pending_output()
             self._typed_start_row = None
         return partial
+
+    def _drain_console_keys(self, quiet: float = 0.1, limit: float = 10.0) -> None:
+        """Read the keys that arrived before the turn ended, as part of the draft.
+
+        Why: a paste still arriving when the turn ended went to the idle prompt,
+        which took each pasted line break as Enter and sent every line on its own.
+        Esc and Ctrl+Enter do nothing here, since the turn is already over.
+        """
+        try:
+            import msvcrt
+        except ImportError:
+            return
+        on_escape, on_send_now = self._on_escape, self._on_send_now
+        self._on_escape = self._on_send_now = None
+        try:
+            deadline = time.monotonic() + limit
+            last_key = time.monotonic()
+            burst: list[str] = []
+            while time.monotonic() < deadline:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ('\x00', '\xe0'):
+                        msvcrt.getwch()
+                    else:
+                        burst.append(ch)
+                    last_key = time.monotonic()
+                    continue
+                if burst:
+                    self.feed_burst(burst)
+                    burst = []
+                if time.monotonic() - last_key >= quiet:
+                    break
+                time.sleep(0.01)
+            if burst:
+                self.feed_burst(burst)
+        except KeyboardInterrupt:
+            pass  # Ctrl+C here ends the read; what was read so far stays in the draft
+        except Exception as _ignored:
+            _log_ignored(_ignored)
+        finally:
+            self._on_escape, self._on_send_now = on_escape, on_send_now
 
     def pause(self) -> None:
         """Stop taking keys and print straight to the real console.
@@ -339,7 +387,10 @@ class ConsoleInputReader:
             draft = getattr(self, '_paused_draft', '')
             self._paused_draft = ''
             for ch in draft:
-                self._feed(ch)
+                if ch == '\n':
+                    self._paste_newline()
+                else:
+                    self._feed(ch)
         self._paused.clear()
 
     @property
@@ -350,6 +401,53 @@ class ConsoleInputReader:
         """Process one typed character (separated out for testing)."""
         with self._lock:
             self._feed(ch)
+
+    def feed_burst(self, chars: list[str]) -> None:
+        """Process the keys read in one poll.
+
+        Why: the console delivers a paste as keystrokes, so each line break in a
+        pasted block used to act as Enter and send every line as its own message.
+        A line break that has more text after it in the same burst, or that is
+        part of a long burst, is a pasted line break and stays in the message.
+        A lone Enter (or Ctrl+Enter) still sends.
+        """
+        pasted = len(chars) >= _PASTE_BURST_CHARS
+        with self._lock:
+            # Why: one write per key made a long paste take many seconds to show.
+            echo: list[str] = []
+
+            def flush_echo() -> None:
+                if echo:
+                    self._write(''.join(echo) + self._park_cursor())
+                    echo.clear()
+
+            index = 0
+            while index < len(chars):
+                ch = chars[index]
+                rest = chars[index + 1:]
+                if ch in ('\r', '\n') and (pasted or any(c not in ('\r', '\n') for c in rest)):
+                    if ch == '\r' and rest[:1] == ['\n']:
+                        index += 1  # CR LF is one line break
+                    if self._buffer:
+                        self._buffer.append('\n')
+                        echo.append(' ')
+                elif self._buffer and (ch >= ' ' or ch == '\t'):
+                    self._buffer.append(ch)
+                    echo.append(ch)
+                else:
+                    flush_echo()
+                    self._feed(ch)
+                index += 1
+            flush_echo()
+
+    def _paste_newline(self) -> None:
+        # A leading line break carries nothing, and the buffer never starts with one.
+        if self._buffer:
+            self._buffer.append('\n')
+            self._write(' ' + self._park_cursor())
+
+    def _shown(self) -> str:
+        return ''.join(self._buffer).replace('\n', ' ')
 
     def _feed(self, ch: str) -> None:
         if ch == '\n' and self._on_send_now is not None:
@@ -389,7 +487,7 @@ class ConsoleInputReader:
                         if self._win_console:
                             self._hide_cursor()
                         self._write('\033[?25l' + clear
-                                    + '\u270e ' + ''.join(self._buffer) + self._park_cursor() + '\033[?25h')
+                                    + '\u270e ' + self._shown() + self._park_cursor() + '\033[?25h')
                         if self._win_console:
                             self._typed_start_row = _win_pencil_row() or _win_cursor_row()
                             self._show_cursor()
@@ -426,12 +524,15 @@ class ConsoleInputReader:
                 time.sleep(self.poll_interval)
                 continue
             try:
-                while not self._paused.is_set() and msvcrt.kbhit():
+                burst: list[str] = []
+                while not self._paused.is_set() and not self._stop.is_set() and msvcrt.kbhit():
                     ch = msvcrt.getwch()
                     if ch in ('\x00', '\xe0'):
                         msvcrt.getwch()  # swallow the second half of arrow/function keys
                         continue
-                    self.feed(ch)
+                    burst.append(ch)
+                if burst:
+                    self.feed_burst(burst)
             except Exception as _ignored:
                 _log_ignored(_ignored)
                 return

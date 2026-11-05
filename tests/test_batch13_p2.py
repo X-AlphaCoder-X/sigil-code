@@ -89,10 +89,17 @@ class RewindSummarizeTests(unittest.TestCase):
             self.assertEqual(after.messages[0]['role'], 'system')  # the system prompt is never summarized
             self.assertTrue(any(m.get('content') == 'Third answer.' for m in after.messages))
             self.assertFalse(any(m.get('content') == 'The answer is 42.' for m in after.messages))
-            request = recorded[-1]['messages'][-1]['content']
-            self.assertIn('[user]\ncreate notes', request)
-            self.assertIn('The answer is 42.', request)
-            self.assertNotIn('Third answer.', request)
+            # 1.1.0: the summary request is the main loop's own (so it reads the prompt cache): the
+            # conversation as messages, the same tools, and an instruction naming the part to summarize.
+            sent = recorded[-1]
+            contents = [str(m.get('content')) for m in sent['messages']]
+            self.assertIn('create notes', contents)
+            self.assertIn('The answer is 42.', contents)
+            self.assertEqual([t['function']['name'] for t in sent.get('tools', [])],
+                             [t.to_openai_tool()['function']['name'] for t in agent.tool_registry.values()])
+            instruction = contents[-1]
+            self.assertIn('before the user message "third question"', instruction)
+            self.assertIn('stay word for word', instruction)
 
     def test_summarize_from_a_prompt_and_aliases(self) -> None:
         recorded: list[dict] = []

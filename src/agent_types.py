@@ -15,6 +15,20 @@ class UsageStats:
     cache_creation_input_tokens: int = 0
     cache_read_input_tokens: int = 0
     reasoning_tokens: int = 0
+    # The part of cache_creation_input_tokens written with the 1-hour TTL (Anthropic-style
+    # usage.cache_creation.ephemeral_1h_input_tokens). Not added again to any total.
+    cache_creation_1h_input_tokens: int = 0
+
+    @property
+    def cache_hit_rate(self) -> float | None:
+        """Share of the prompt read from the cache, or None when nothing was read or written yet."""
+        prompt = self.prompt_tokens
+        return (self.cache_read_input_tokens / prompt) if prompt else None
+
+    @property
+    def prompt_tokens(self) -> int:
+        """Everything the model read this turn: uncached input plus cache reads and writes."""
+        return self.input_tokens + self.cache_creation_input_tokens + self.cache_read_input_tokens
 
     @property
     def total_tokens(self) -> int:
@@ -36,6 +50,9 @@ class UsageStats:
                 self.cache_read_input_tokens + other.cache_read_input_tokens
             ),
             reasoning_tokens=self.reasoning_tokens + other.reasoning_tokens,
+            cache_creation_1h_input_tokens=(
+                self.cache_creation_1h_input_tokens + other.cache_creation_1h_input_tokens
+            ),
         )
 
     def to_dict(self) -> JSONDict:
@@ -45,6 +62,7 @@ class UsageStats:
             'cache_creation_input_tokens': self.cache_creation_input_tokens,
             'cache_read_input_tokens': self.cache_read_input_tokens,
             'reasoning_tokens': self.reasoning_tokens,
+            'cache_creation_1h_input_tokens': self.cache_creation_1h_input_tokens,
             'total_tokens': self.total_tokens,
         }
 
@@ -55,19 +73,22 @@ class ModelPricing:
     output_cost_per_million_tokens_usd: float = 0.0
     cache_creation_input_cost_per_million_tokens_usd: float = 0.0
     cache_read_input_cost_per_million_tokens_usd: float = 0.0
+    # Writes with the 1-hour TTL (Anthropic: 2x input, against 1.25x for 5 minutes).
+    cache_creation_1h_input_cost_per_million_tokens_usd: float = 0.0
 
     def estimate_cost_usd(self, usage: UsageStats) -> float:
+        # Why: with no cache prices set, cache tokens cost the input price. The estimate then never
+        # drops below what it was before cached tokens were split out of input_tokens.
+        write_price = self.cache_creation_input_cost_per_million_tokens_usd or self.input_cost_per_million_tokens_usd
+        read_price = self.cache_read_input_cost_per_million_tokens_usd or self.input_cost_per_million_tokens_usd
+        write_1h_price = self.cache_creation_1h_input_cost_per_million_tokens_usd or write_price
+        written_1h = max(0, min(usage.cache_creation_1h_input_tokens, usage.cache_creation_input_tokens))
         return (
             (usage.input_tokens / 1_000_000.0) * self.input_cost_per_million_tokens_usd
             + (usage.output_tokens / 1_000_000.0) * self.output_cost_per_million_tokens_usd
-            + (
-                usage.cache_creation_input_tokens / 1_000_000.0
-            )
-            * self.cache_creation_input_cost_per_million_tokens_usd
-            + (
-                usage.cache_read_input_tokens / 1_000_000.0
-            )
-            * self.cache_read_input_cost_per_million_tokens_usd
+            + ((usage.cache_creation_input_tokens - written_1h) / 1_000_000.0) * write_price
+            + (written_1h / 1_000_000.0) * write_1h_price
+            + (usage.cache_read_input_tokens / 1_000_000.0) * read_price
         )
 
 

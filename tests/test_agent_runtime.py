@@ -791,6 +791,8 @@ class AgentRuntimeTests(unittest.TestCase):
                 metadata={'kind': 'compact_summary', 'is_compact_summary': True},
             )
             session.messages = [session.messages[0], boundary, summary] + preserved_tail
+            # like compact_conversation: the summary call is counted once, as a side call
+            agent.record_side_usage(UsageStats(input_tokens=7, output_tokens=3))
             return CompactionResult(
                 boundary_message=boundary,
                 summary_messages=[summary],
@@ -886,7 +888,10 @@ class AgentRuntimeTests(unittest.TestCase):
         self.assertTrue(
             any(event.get('type') == 'auto_compact_summary' for event in result.events)
         )
-        self.assertGreaterEqual(result.usage.total_tokens, 25)
+        # 1.1.0: the run's own calls are in result.usage, the summary is a side call; both are in the
+        # session totals once (15 + 10)
+        self.assertGreaterEqual(result.usage.total_tokens + agent.side_totals()[0].total_tokens, 25)
+        self.assertGreaterEqual(agent.cumulative_usage.total_tokens, 25)
 
     def test_agent_continues_when_model_response_is_truncated(self) -> None:
         responses = [

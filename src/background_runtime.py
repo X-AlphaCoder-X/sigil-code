@@ -340,11 +340,16 @@ class BackgroundSessionRuntime:
                                               record.background_id, record.pid)
         elif sys.platform == 'win32':
             # os.killpg/os.WNOHANG do not exist on Windows; terminate the whole tree.
-            subprocess.run(
-                ['taskkill', '/PID', str(record.pid), '/T', '/F'],
-                capture_output=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
+            try:
+                # timeout: a hung taskkill must not block the stop path forever
+                subprocess.run(
+                    ['taskkill', '/PID', str(record.pid), '/T', '/F'],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                    timeout=10,
+                )
+            except (OSError, subprocess.SubprocessError) as _bg_ignored:
+                _log_ignored(_bg_ignored)
         else:
             # the worker leads its own group (start_new_session): signal that group, or the pid alone
             if not safe_killpg(record.pid, signal.SIGTERM):
@@ -730,7 +735,7 @@ def _process_start_time(pid: int) -> float | None:
             boot = next(int(line.split()[1]) for line in Path('/proc/stat').read_text().splitlines()
                         if line.startswith('btime '))
             return boot + start_ticks / os.sysconf('SC_CLK_TCK')
-        out = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True,
+        out = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, encoding='utf-8', errors='replace',
                              timeout=5, env={**os.environ, 'LC_ALL': 'C'}).stdout.strip()
         return time.mktime(time.strptime(out, '%a %b %d %H:%M:%S %Y')) if out else None
     except (OSError, ValueError, IndexError, StopIteration, subprocess.SubprocessError) as exc:

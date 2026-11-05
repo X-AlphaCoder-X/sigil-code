@@ -7,7 +7,7 @@ What Sigil Code doesn't do yet, and what it won't do. Ideas and bug reports are 
 
 ### Sandbox
 - A bash sandbox on native Windows. Linux (bubblewrap) and macOS (sandbox-exec) isolate files and
-  network; on Windows `SIGIL_SANDBOX=1` only sets Job Object limits (memory, processes). Use WSL2
+  network. On Windows `SIGIL_SANDBOX=1` only sets Job Object limits (memory, processes). Use WSL2
   for full isolation.
 
 ### MCP
@@ -19,7 +19,7 @@ What Sigil Code doesn't do yet, and what it won't do. Ideas and bug reports are 
   not only while the agent works on those files.
 
 ### Sessions
-- Asking whether to keep or remove a `-w` worktree when the session ends. It is kept today;
+- Asking whether to keep or remove a `-w` worktree when the session ends. It is kept today, and
   `sigil worktree-exit --action remove` removes it.
 
 ### Packaging

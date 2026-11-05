@@ -28,15 +28,41 @@ from .ask_user_runtime import AskUserRuntime
 from .agent_runtime import LocalCodingAgent
 from .message_queue import ConsoleInputReader, MessageQueue
 
+def _shown_in_history(message: Any) -> bool:
+    """Whether a saved message belongs in the conversation shown on resume: what the user typed and what the
+    agent answered. The system prompt and the runtime's own <system-reminder> messages (session context,
+    MCP status, resume hints) are left out. Why: they used to be printed as if the user had typed them."""
+    if not isinstance(message, dict) or message.get('role') not in ('user', 'assistant'):
+        return False
+    content = message.get('content')
+    if isinstance(content, str) and content.lstrip().startswith('<system-reminder>'):
+        return False
+    return True
+
+
+def _history_lines(messages: Any) -> list[str]:
+    """The lines printed for a resumed session's earlier conversation (see _shown_in_history)."""
+    lines = []
+    for message in messages or ():
+        if not _shown_in_history(message):
+            continue
+        content = message.get('content')
+        if message.get('role') == 'user':
+            lines.append(f'user> {content}')
+        elif content:
+            lines.append(f'agent> {content}')
+    return lines
+
+
 # Simple .env loader for systems without python-dotenv
-def _load_env_file():
-    env_path = Path(__file__).parent.parent / '.env'
+def _load_env_file(env_path=None):
+    env_path = env_path or Path(__file__).parent.parent / '.env'
     if env_path.exists():
-        for line in env_path.read_text(encoding='utf-8').splitlines():
-            line = line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                key, value = line.split('=', 1)
-                os.environ.setdefault(key.strip(), value.strip())
+        # utf-8-sig: a file saved with a byte order mark used to turn its first line into a variable
+        from .env_file import read_env_lines  # python-dotenv rules: inline comments, quotes, export
+
+        for key, value in read_env_lines(env_path.read_text(encoding='utf-8-sig'), str(env_path)):
+            os.environ.setdefault(key, value)
 
 _load_env_file()
 
@@ -158,6 +184,7 @@ def _lookup_latest_session_id(
     cwd: str,
     is_backup: bool = False,
     session_dir: Path | None = None,
+    user_only: bool = False,
 ) -> str:
     workspace = Path(cwd).resolve()
 
@@ -177,6 +204,10 @@ def _lookup_latest_session_id(
     # subagent (<id>--sub--N) and background (bg_*) sessions are not what -c / -r mean
     sessions = [p for p in session_dir.glob('*.json')
                 if '--sub--' not in p.stem and not p.stem.startswith('bg_') and p.stem != 'session_backup']
+    if user_only:  # a chat's -c / -r: the user's own sessions, not -p runs or background agents
+        from .session_store import is_user_session
+
+        sessions = [p for p in sessions if is_user_session(session_dir, p.stem)]
     if not sessions:
         raise OSError(f"No saved sessions found in {session_dir}")
     
@@ -197,6 +228,10 @@ def _add_agent_common_args(parser: argparse.ArgumentParser, *, include_backend: 
         parser.add_argument('--timeout-seconds', type=float, default=120.0)
         parser.add_argument('--input-cost-per-million', type=float, default=0.0)
         parser.add_argument('--output-cost-per-million', type=float, default=0.0)
+        # Cache prices; unset = derived from the input price for known providers (prompt_cache.price_ratios)
+        parser.add_argument('--cache-read-cost-per-million', type=float, default=None)
+        parser.add_argument('--cache-write-cost-per-million', type=float, default=None)
+        parser.add_argument('--cache-write-1h-cost-per-million', type=float, default=None)
     parser.add_argument('--cwd', default='.')
     parser.add_argument('--add-dir', action='append', default=[])
     parser.add_argument('--image', action='append', default=[],
@@ -415,24 +450,62 @@ def _build_model_config(args: argparse.Namespace) -> ModelConfig:
     from .profiles import resolve_api_key
 
     base_url = getattr(args, 'base_url', os.environ.get('OPENAI_BASE_URL', 'http://127.0.0.1:8000/v1'))
+    api_key = resolve_api_key(base_url, getattr(args, 'api_key', None))
     return ModelConfig(
         model=args.model,
         base_url=base_url,
-        api_key=resolve_api_key(base_url, getattr(args, 'api_key', None)),
+        api_key=api_key,
         temperature=getattr(args, 'temperature', None),
         timeout_seconds=getattr(args, 'timeout_seconds', 120.0),
         effort=(None if getattr(args, 'effort', None) in (None, 'auto') else args.effort),
         fallback_models=tuple(
             item.strip() for item in (getattr(args, 'fallback_model', None) or '').split(',') if item.strip()),
         max_tokens=getattr(args, 'max_tokens', None),
-        pricing=ModelPricing(
+        pricing=_cache_pricing(ModelPricing(
             input_cost_per_million_tokens_usd=float(
                 getattr(args, 'input_cost_per_million', 0.0) or 0.0
             ),
             output_cost_per_million_tokens_usd=float(
                 getattr(args, 'output_cost_per_million', 0.0) or 0.0
             ),
-        ),
+        ), args, base_url, api_key),
+    )
+
+
+def _cache_pricing(pricing: ModelPricing, args: argparse.Namespace, base_url: str,
+                   api_key: str = '') -> ModelPricing:
+    """Prices for the model: a --*-cost-per-million flag wins; else the model's known prices (the
+    server's published list or the modelPrices table, see model_info.model_prices); for cache
+    prices else the input price times the provider's ratio (prompt_cache.price_ratios); else unset
+    (cache tokens then cost the input price, as before)."""
+    from dataclasses import replace as _replace
+
+    from .prompt_cache import derived_cache_price, known_prices, price_ratios
+
+    model = str(getattr(args, 'model', '') or '')
+    known = known_prices(base_url, model, api_key)
+    ratios = price_ratios(base_url, model)
+    base = pricing.input_cost_per_million_tokens_usd or float(known.get('input', 0.0))
+    output = pricing.output_cost_per_million_tokens_usd or float(known.get('output', 0.0))
+
+    def pick(flag: str, ratio: float | None, key: str, current: float) -> float:
+        value = getattr(args, flag, None)
+        if value is not None:
+            return float(value)
+        return derived_cache_price(base, ratio, known.get(key)) or current
+
+    return _replace(
+        pricing,
+        input_cost_per_million_tokens_usd=base,
+        output_cost_per_million_tokens_usd=output,
+        cache_read_input_cost_per_million_tokens_usd=pick(
+            'cache_read_cost_per_million', ratios.read, 'cache_read', pricing.cache_read_input_cost_per_million_tokens_usd),
+        cache_creation_input_cost_per_million_tokens_usd=pick(
+            'cache_write_cost_per_million', ratios.write_5m, 'cache_write',
+            pricing.cache_creation_input_cost_per_million_tokens_usd),
+        cache_creation_1h_input_cost_per_million_tokens_usd=pick(
+            'cache_write_1h_cost_per_million', ratios.write_1h, 'cache_write_1h',
+            pricing.cache_creation_1h_input_cost_per_million_tokens_usd),
     )
 
 
@@ -748,6 +821,28 @@ def _bg_mark(session_id: str) -> str:
     return '  [bg]' if session_id.startswith('bg_') else ''
 
 
+def _take_typeahead(pt_session: Any) -> str:
+    """Keys prompt_toolkit read past an Enter, as text for the next draft.
+
+    Why: prompt_toolkit replays those keys into the next prompt, so a pasted
+    block that was not seen as a paste sent one line per turn on its own.
+    """
+    try:
+        from prompt_toolkit.input.typeahead import get_typeahead
+        from prompt_toolkit.keys import Keys
+
+        text = []
+        for key in get_typeahead(pt_session.input):
+            if key.key in (Keys.ControlM, Keys.ControlJ):
+                text.append('\n')
+            elif key.key == Keys.BracketedPaste or not isinstance(key.key, Keys):
+                text.append(key.data)
+        return ''.join(text).strip('\n')
+    except Exception as _ignored:
+        _log_ignored(_ignored)
+        return ''
+
+
 def _print_turn_done(output_func: Callable[[str], None], elapsed: float) -> None:
     """After a turn of at least SIGIL_COMPLETION_MIN_SECONDS (1): "✻ Baked for 12s"."""
     from .prompt_constants import TEARDROP_ASTERISK, random_completion_verb
@@ -796,6 +891,9 @@ def _append_agent_forwarded_args(
             ('--timeout-seconds', getattr(args, 'timeout_seconds', None)),
             ('--input-cost-per-million', getattr(args, 'input_cost_per_million', None)),
             ('--output-cost-per-million', getattr(args, 'output_cost_per_million', None)),
+            ('--cache-read-cost-per-million', getattr(args, 'cache_read_cost_per_million', None)),
+            ('--cache-write-cost-per-million', getattr(args, 'cache_write_cost_per_million', None)),
+            ('--cache-write-1h-cost-per-million', getattr(args, 'cache_write_1h_cost_per_million', None)),
         ):
             if value is not None:
                 command.extend([name, str(value)])
@@ -867,6 +965,8 @@ def _append_agent_forwarded_args(
 
 def _add_agent_resume_args(parser: argparse.ArgumentParser) -> None:
     _add_agent_common_args(parser, include_backend=True)
+    # unset unless given: the session's stored prices stay (a 0.0 default used to replace them)
+    parser.set_defaults(input_cost_per_million=None, output_cost_per_million=None)
     parser.add_argument('session_id', nargs='?', default='latest', help='Session ID or "latest" / "backup"')
     parser.add_argument('prompt')
     parser.add_argument('--show-transcript', action='store_true')
@@ -951,6 +1051,7 @@ def _run_background_worker(args: argparse.Namespace) -> int:
             background_runtime.root, args.background_id, request,
             on_wait=lambda note: background_runtime.set_note(args.background_id, note))
         # The session id is the background id, so a restarted agent can continue it.
+        agent.session_origin = 'background'
         stored = None
         if getattr(args, 'resume_session', False):
             try:
@@ -960,7 +1061,7 @@ def _run_background_worker(args: argparse.Namespace) -> int:
                 stored = None  # stopped before saving: start the prompt again
         result = (agent.resume(args.prompt, stored) if stored is not None
                   else agent.run(args.prompt, session_id=args.background_id))
-        _print_agent_result(result, show_transcript=args.show_transcript)
+        _print_agent_result(_with_side_calls(agent, result), show_transcript=args.show_transcript)
         from .command_hooks import fire_session_end
 
         fire_session_end(agent.command_hook_runtime, result.session_id, 'other')
@@ -968,12 +1069,13 @@ def _run_background_worker(args: argparse.Namespace) -> int:
         stop_reason = result.stop_reason or 'completed'
         session_id = result.session_id
         session_path = result.session_path
+        shown = _with_side_calls(agent, result)  # summaries, hooks, subagents are part of its cost
         background_runtime.write_result(args.background_id, {
             'final_output': result.final_output,
             'session_id': result.session_id,
             'stop_reason': result.stop_reason,
-            'total_cost_usd': result.total_cost_usd,
-            'usage': result.usage.to_dict(),
+            'total_cost_usd': shown.total_cost_usd,
+            'usage': shown.usage.to_dict(),
             'turns': result.turns,
         })
         return 0
@@ -1073,6 +1175,7 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
     
     stored_session = load_agent_session(session_id, directory=_session_directory_for(args.cwd))
     model_config = deserialize_model_config(stored_session.model_config)
+    stored_model_config = model_config
     runtime_config = deserialize_runtime_config(stored_session.runtime_config)
     if os.environ.get('SIGIL_RESUME_STORED_PERMISSIONS', '').strip().lower() not in ('1', 'true', 'yes', 'on'):
         # why (S14): the session file lives in the workspace and can be edited or planted, so the
@@ -1097,23 +1200,42 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
         model_config = replace(model_config, temperature=args.temperature)
     if args.timeout_seconds is not None:
         model_config = replace(model_config, timeout_seconds=args.timeout_seconds)
+    # Prices: first derived again for a new model or endpoint (the stored session's flag prices are
+    # kept, see prompt_cache.reprice), then any price flag given on this command line wins.
+    from .prompt_cache import reprice
+
+    model_config = replace(model_config, pricing=reprice(
+        model_config.pricing, str(stored_model_config.base_url), stored_model_config.model,
+        str(model_config.base_url), model_config.model, api_key=str(model_config.api_key)))
     if args.input_cost_per_million is not None or args.output_cost_per_million is not None:
+        before = model_config.pricing
         model_config = replace(
             model_config,
             pricing=replace(
-                model_config.pricing,
+                before,
                 input_cost_per_million_tokens_usd=(
                     args.input_cost_per_million
                     if args.input_cost_per_million is not None
-                    else model_config.pricing.input_cost_per_million_tokens_usd
+                    else before.input_cost_per_million_tokens_usd
                 ),
                 output_cost_per_million_tokens_usd=(
                     args.output_cost_per_million
                     if args.output_cost_per_million is not None
-                    else model_config.pricing.output_cost_per_million_tokens_usd
+                    else before.output_cost_per_million_tokens_usd
                 ),
             ),
         )
+        # cache prices that came from the input price follow the new input price
+        model_config = replace(model_config, pricing=reprice(
+            model_config.pricing, str(model_config.base_url), model_config.model,
+            str(model_config.base_url), model_config.model,
+            old_input=before.input_cost_per_million_tokens_usd, api_key=str(model_config.api_key)))
+    for flag, field_name in (('cache_read_cost_per_million', 'cache_read_input_cost_per_million_tokens_usd'),
+                             ('cache_write_cost_per_million', 'cache_creation_input_cost_per_million_tokens_usd'),
+                             ('cache_write_1h_cost_per_million', 'cache_creation_1h_input_cost_per_million_tokens_usd')):
+        if getattr(args, flag, None) is not None:
+            model_config = replace(model_config, pricing=replace(model_config.pricing,
+                                                                 **{field_name: float(getattr(args, flag))}))
 
     if getattr(args, "max_turns", None) is not None:
         runtime_config = replace(runtime_config, max_turns=args.max_turns)
@@ -1246,11 +1368,31 @@ def _build_resumed_agent(args: argparse.Namespace) -> tuple[LocalCodingAgent, St
     return agent, stored_session
 
 
+def _with_side_calls(agent: Any, result: Any) -> Any:
+    """The run result with the session's side calls added (summaries, compaction, /btw, hooks, the
+    web_fetch prompt, subagents), for what is printed or reported. The session file keeps them
+    apart, so this is never saved."""
+    from .explicit_cache import storage_cost_usd
+
+    # explicit cache storage (Gemini, Vertex) of this process, as in /cost; a background agent's record
+    # gets its own process's storage
+    storage = storage_cost_usd()
+    totals = getattr(agent, 'side_totals', None)
+    count = 0
+    if callable(totals) and getattr(result, 'session_id', None):
+        usage, cost, count = totals(result.session_id)
+    if not count and not storage:
+        return result
+    if not count:
+        return replace(result, total_cost_usd=result.total_cost_usd + storage)
+    return replace(result, usage=result.usage + usage, total_cost_usd=result.total_cost_usd + cost + storage)
+
+
 def _print_agent_result(result, *, show_transcript: bool) -> None:
     print(result.final_output)
     print('\n# Usage')
     print(f'total_tokens={result.usage.total_tokens}')
-    print(f'input_tokens_cumulative={result.usage.input_tokens}')
+    print(f'input_tokens_cumulative={result.usage.prompt_tokens}')  # cached tokens included, as before 1.1.0
     print(f'last_context_tokens={result.last_turn_input_tokens}')
     print(f'output_tokens={result.usage.output_tokens}')
     print(f'total_cost_usd={result.total_cost_usd:.6f}')
@@ -1347,12 +1489,23 @@ def _pick_session_in_chat(agent: Any, arg: str, output_func: Callable[[str], Non
     from .session_store import list_agent_sessions, session_first_prompt
 
     directory = agent.runtime_config.session_directory
+    show_all = arg.strip().lower() == 'all'
+    if show_all:
+        arg = ''
     if not arg:
         sessions = list_agent_sessions(directory)
+        hidden = 0
+        if not show_all:
+            from .session_store import is_user_session
+
+            mine = [s for s in sessions if is_user_session(directory, s[0])]
+            hidden, sessions = len(sessions) - len(mine), mine
         if not sessions:
-            output_func('No saved sessions in this workspace.')
+            output_func('No saved sessions in this workspace.' + (
+                f' {hidden} -p or background session(s) are hidden: /resume all shows them.' if hidden else ''))
             return None
-        output_func('Saved sessions (newest first):')
+        output_func('Saved sessions (newest first):' + (
+            f'  ({hidden} -p or background session(s) hidden: /resume all shows them)' if hidden else ''))
         for index, (session_id, mtime, count) in enumerate(sessions[:20]):
             stamp = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
             first = session_first_prompt(directory, session_id)
@@ -1457,17 +1610,13 @@ def _load_env_values(path: Path) -> list[str]:
     except OSError as _ignored:
         _log_ignored(_ignored)
         return []
+    from .env_file import read_env_lines  # python-dotenv rules: inline comments, quotes, export
+
     filled: list[str] = []
-    for line in text.splitlines():
-        line = line.strip()
-        if line and not line.startswith('#') and '=' in line:
-            key, value = line.split('=', 1)
-            key = key.strip()
-            if key.startswith('export '):
-                key = key[len('export '):].strip()
-            if key and key not in os.environ:
-                os.environ[key] = value.strip().strip('"').strip("'")
-                filled.append(key)
+    for key, value in read_env_lines(text, str(path)):
+        if key not in os.environ:
+            os.environ[key] = value
+            filled.append(key)
     return filled
 
 
@@ -1594,6 +1743,8 @@ def _run_agent_chat_loop(
     output_func: Callable[[str], None] = print,
     result_printer: Callable[..., None] = _print_agent_result,
 ) -> int:
+    agent.session_origin = 'chat'  # a session the user works in: /resume and -c show these
+    _note_undecided_trust(agent, output_func)
     active_session_id = resume_session_id
     if active_session_id and active_session_id not in ('latest', 'backup'):
         from .session_store import resolve_session_name
@@ -1606,6 +1757,7 @@ def _run_agent_chat_loop(
                 str(agent.runtime_config.cwd),
                 is_backup=(active_session_id == 'backup'),
                 session_dir=agent.runtime_config.session_directory,
+                user_only=True,
             )
         except OSError as exc:
             output_func(f'No session to resume ({exc}); starting a new one.')
@@ -1620,6 +1772,7 @@ def _run_agent_chat_loop(
             output_func(f'forked_session_id={forked} (from {active_session_id})')
             active_session_id = forked
     first_prompt = initial_prompt
+    next_draft = ''  # text typed during the last turn, waiting in the input box for Enter
     end_reason = 'other'
 
     # Launchers can enter here without going through main(), so VT processing
@@ -1745,7 +1898,7 @@ def _run_agent_chat_loop(
                     if tui:
                         # Filter and replay last 10 relevant messages
                         # We convert AgentMessage to TUI events
-                        history = historical_session.messages[-15:] # Buffer for context
+                        history = [m for m in historical_session.messages if _shown_in_history(m)][-15:]
                         for msg in history:
                             role = msg.get('role')
                             content = msg.get('content')
@@ -1776,15 +1929,8 @@ def _run_agent_chat_loop(
                     
                     elif show_transcript:
                         output_func('\n--- Previous Conversation History ---')
-                        for msg in historical_session.messages:
-                            role = msg.get('role')
-                            content = msg.get('content')
-                            if role == 'user':
-                                output_func(f'user> {content}')
-                            elif role == 'assistant' and content:
-                                output_func(f'agent> {content}')
-                            elif role == 'system' and content and not content.startswith('<system-reminder>'):
-                                output_func(f'system> {content}')
+                        for line in _history_lines(historical_session.messages):
+                            output_func(line)
                         output_func('--------------------------------------\n')
             except Exception as e:
                 output_func(f'Warning: Could not load history transcript: {e}')
@@ -1805,7 +1951,53 @@ def _run_agent_chat_loop(
 
         scheduler = Scheduler()
         agent.scheduler = scheduler
-        _register_cron_tools(agent, scheduler)
+        cron_disabled = os.environ.get('SIGIL_DISABLE_CRON', '').strip().lower() in ('1', 'true', 'yes', 'on')
+        if not cron_disabled:  # registered before the first model call and never changed: the cache keeps
+            _register_cron_tools(agent, scheduler)
+
+        def _loop_cache_lifetime() -> tuple[int | None, str]:
+            # worked out at each run for the model in use now, so /model and /profile are followed
+            from .anthropic_client import AnthropicClient
+            from .prompt_cache import cache_lifetime
+
+            return cache_lifetime(agent.model_config.base_url or '', agent.model_config.model or '',
+                                  native=isinstance(getattr(agent, 'client', None), AnthropicClient),
+                                  cwd=agent.runtime_config.cwd)
+
+        scheduler.cache_lifetime = _loop_cache_lifetime
+        loop_run_active = False
+        loops_save_warned = False
+
+        def _save_loops(session_id: str | None) -> None:
+            nonlocal loops_save_warned
+            if not session_id or cron_disabled:
+                return
+            from .scheduler import save_state
+
+            try:
+                save_state(scheduler, agent.runtime_config.session_directory, session_id)
+            except (OSError, ValueError) as exc:
+                _log_ignored(exc)
+                if not loops_save_warned:
+                    loops_save_warned = True
+                    output_func(f'\033[33mCould not save the scheduled prompts of this session '
+                                f'({type(exc).__name__}); they still run until the chat ends.\033[0m')
+
+        def _loop_line(text: str) -> str:
+            # prompts and the agent's reasons reach the terminal as plain text only
+            from .terminal import strip_terminal_controls
+
+            return strip_terminal_controls(text)
+
+        def _restore_loops(session_id: str | None) -> None:
+            if not session_id or cron_disabled:
+                return
+            from .scheduler import restore_state
+
+            for line in restore_state(scheduler, agent.runtime_config.session_directory, session_id):
+                output_func(f'\033[2m  ↻ {_loop_line(line)}\033[0m')
+
+        _restore_loops(active_session_id)
         goal_state: dict[str, Any] = {}
         import threading as _threading
 
@@ -1834,11 +2026,21 @@ def _run_agent_chat_loop(
             next_is_auto_test = False
             if first_prompt is None:
                 due = scheduler.pop_due()
-                if due is not None:
+                if due is not None and due.source == 'loop' and scheduler.loop is not None:
+                    from .scheduler import loop_prompt_text
+                    from .terminal import strip_terminal_controls
+
+                    output_func(f'\033[2m  ↻ {scheduler.loop.loop_id} run {scheduler.loop.runs}: '
+                                f'{strip_terminal_controls(due.prompt)}\033[0m')
+                    first_prompt = loop_prompt_text(scheduler.loop)
+                    loop_run_active = True
+                elif due is not None:
                     from .scheduler import prompt_text
                     from .terminal import strip_terminal_controls
 
-                    output_func(f'\033[2m  ↳ scheduled prompt {due.job_id}: {strip_terminal_controls(due.prompt)}\033[0m')
+                    final = ' (final run: 7 days)' if due.final else ''
+                    output_func(f'\033[2m  ↳ scheduled prompt {due.job_id}{final}: '
+                                f'{strip_terminal_controls(due.prompt)}\033[0m')
                     first_prompt = prompt_text(due)
             if first_prompt is not None:
                 prompt = first_prompt
@@ -1865,7 +2067,11 @@ def _run_agent_chat_loop(
                     if HAS_PROMPT_TOOLKIT and pt_session and ANSI:
                         with patch_stdout():
                             agent_bar.reset()
-                            prompt = pt_session.prompt(ANSI(pt_label), **bar_kwargs)
+                            draft = '\n'.join(part for part in (next_draft, _take_typeahead(pt_session)) if part)
+                            next_draft = ''
+                            if draft:
+                                output_func('\033[2m  \u21b3 your unsent text is in the input box; press Enter to send it\033[0m')
+                            prompt = pt_session.prompt(ANSI(pt_label), default=draft, **bar_kwargs)
                     else:
                         prompt = input_func(plain_label)
                 except EOFError:
@@ -1911,24 +2117,58 @@ def _run_agent_chat_loop(
             # [SCHEDULE] /loop <interval|cron> <prompt>, /loop stop [id|all]; /goal <goal>, /goal stop
             if normalized == '/loop' or normalized.startswith('/loop '):
                 rest = normalized[len('/loop'):].strip()
-                if not rest:
+                if cron_disabled:
+                    output_func('Scheduled prompts are off (SIGIL_DISABLE_CRON=1).')
+                elif not rest:
                     output_func(scheduler.render())
                 elif rest == 'stop' or rest.startswith('stop '):
                     target = rest[len('stop'):].strip() or 'all'
                     output_func(f'Stopped {target}.' if scheduler.delete(target) else f'Nothing to stop: {target}')
+                    _save_loops(active_session_id)
                 else:
                     import re as _re
 
+                    from .scheduler import parse_interval as _parse_interval
+
                     cron_fields = rest.split()
+                    every = _re.match(r'every\s+(\d+(?:\.\d+)?\s*[a-z]+)\s+(.+)', rest, _re.I | _re.S)
                     if len(cron_fields) > 5 and all(_re.fullmatch(r'[\d*/,-]+', f) for f in cron_fields[:5]):
                         schedule, loop_prompt = ' '.join(cron_fields[:5]), ' '.join(cron_fields[5:])
+                    elif every and _parse_interval(every.group(1)) is not None:
+                        schedule, loop_prompt = every.group(1), every.group(2)
                     else:
                         schedule, _, loop_prompt = rest.partition(' ')
-                    try:
-                        job = scheduler.add(schedule, loop_prompt)
+                    fixed = len(cron_fields) > 5 and schedule == ' '.join(cron_fields[:5]) or \
+                        _parse_interval(schedule) is not None
+                    if not fixed:
+                        # no interval: self-paced, the first run is now and the agent picks each next one
+                        try:
+                            loop = scheduler.start_loop(rest)
+                        except ValueError as exc:
+                            output_func(f'/loop: {exc}.')
+                            continue
+                        output_func(f'Self-paced loop {loop.loop_id}: {loop.prompt}\n  The agent picks when each next '
+                                    f'run happens (1 minute to 1 hour). /loop stop {loop.loop_id} ends it.')
+                        from .scheduler import loop_prompt_text
+
+                        first_prompt = loop_prompt_text(loop)
+                        loop_run_active = True
+                    else:
+                        try:
+                            job = scheduler.add(schedule, loop_prompt)
+                        except ValueError as exc:
+                            output_func(f'/loop: {exc}. Usage: /loop 5m <prompt>, /loop */15 * * * * <prompt>, '
+                                        'or /loop <prompt> to let the agent pick the timing')
+                            continue
                         output_func(f'Scheduled {job.job_id}: every {job.schedule}: {job.prompt} (/loop stop {job.job_id})')
-                    except ValueError as exc:
-                        output_func(f'/loop: {exc}. Usage: /loop 5m <prompt>  or  /loop */15 * * * * <prompt>')
+                        lifetime, about = scheduler._lifetime()
+                        if job.interval and lifetime and scheduler.warm_lead(job.interval):
+                            output_func(f'\033[2m  Each run starts 15 s early, while the prompt cache ({about}) is '
+                                        'still warm.\033[0m')
+                        elif job.interval and lifetime and job.interval > lifetime:
+                            output_func(f'\033[2m  The prompt cache here lasts {about}, so each run reads the whole '
+                                        'prompt again at full price.\033[0m')
+                        _save_loops(active_session_id)
                 continue
             if normalized == '/goal' or normalized.startswith('/goal '):
                 goal = normalized[len('/goal'):].strip()
@@ -2049,8 +2289,12 @@ def _run_agent_chat_loop(
                                                (lambda label: pt_session.prompt(label)) if pt_session is not None
                                                else input_func)
                 if picked:
+                    # the scheduled prompts belong to their session: keep this one's, bring the other's back
+                    _save_loops(active_session_id)
+                    scheduler.clear()
                     active_session_id = picked
                     output_func(f'resuming_session_id={picked}')
+                    _restore_loops(picked)
                 continue
 
             if shell_notes:
@@ -2085,8 +2329,11 @@ def _run_agent_chat_loop(
                     _echo('\n\033[33m⏹ Esc pressed: interrupting...\033[0m\n')
                     _thread.interrupt_main()
 
+                reader_holder['send_now'] = False
+
                 def _send_now() -> None:
                     import _thread
+                    reader_holder['send_now'] = True
                     _echo('\n\033[33m\u23f5 Ctrl+Enter: sending the queued message(s) now...\033[0m\n')
                     _thread.interrupt_main()
 
@@ -2123,12 +2370,16 @@ def _run_agent_chat_loop(
                     set_title(session_title(agent, 'ready'))
                     agent_bar.mode = getattr(agent, 'permission_mode', agent_bar.mode)  # /plan <task>
                     if input_reader is not None:
-                        input_reader.stop()
+                        partial = input_reader.stop()
                         input_reader.restore_output()
                         leftover = agent.message_queue.drain() if agent.message_queue else []
                         agent.message_queue = None
-                        if leftover:
-                            first_prompt = '\n\n'.join(leftover)
+                        if leftover and reader_holder.pop('send_now', False):
+                            first_prompt = '\n\n'.join(leftover)  # Ctrl+Enter: send now
+                            leftover = []
+                        # Why: text typed or pasted as the turn ends waits for Enter instead
+                        # of starting a new turn on its own and spending tokens.
+                        next_draft = '\n\n'.join(leftover + ([partial] if partial else []))
                 result_printer(result if shown is None else replace(result, final_output=shown),
                                show_transcript=show_transcript or agent_bar.verbose)  # Ctrl+O
                 _print_turn_done(output_func, time.monotonic() - run_started)
@@ -2160,6 +2411,12 @@ def _run_agent_chat_loop(
                 if first_prompt is not None:
                     output_func(f'\033[2m  ↳ sending queued message: {first_prompt}\033[0m')
                 active_session_id = result.session_id
+                if loop_run_active:  # a run of the self-paced loop ended: its next run, the fallback, or the end
+                    loop_run_active = False
+                    loop_note = scheduler.end_loop_run(interrupted=result.stop_reason == 'interrupted')
+                    if loop_note:
+                        output_func(f'\033[2m  ↻ {_loop_line(loop_note)}\033[0m')
+                _save_loops(active_session_id)
 
                 if result.stop_reason == 'interrupted':
                     output_func('\n[!] Query halted. (Press Ctrl+C at the prompt to exit session)')
@@ -2190,6 +2447,12 @@ def _run_agent_chat_loop(
                 output_func(f'\033[91m{traceback.format_exc()}\033[0m')
                 output_func(f'\nSession: \033[33m{active_session_id}\033[0m')
                 output_func('The PowerShell window was kept open so you can see this error. Please report it.')
+                if loop_run_active:  # the failed run did not pick a next one: the fallback rule applies
+                    loop_run_active = False
+                    loop_note = scheduler.end_loop_run()
+                    if loop_note:
+                        output_func(f'\033[2m  ↻ {_loop_line(loop_note)}\033[0m')
+                _save_loops(active_session_id)
                 # We don't return here so the loop continues (or user can /exit)
                 continue
     finally:
@@ -2693,6 +2956,8 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser = subparsers.add_parser('sessions', help='list saved sessions and pick one to resume')
     sessions_parser.add_argument('--max-turns', type=int, default=0)
     sessions_parser.add_argument('--search', default=None, help='only sessions whose messages contain this text')
+    sessions_parser.add_argument('--all', action='store_true',
+                                 help='also list -p runs and background agents (hidden by default)')
     plugin_parser = subparsers.add_parser('plugin', help='plugin marketplaces: marketplace add|list, install, list')
     plugin_parser.add_argument('words', nargs='*')
     purge_parser = subparsers.add_parser('purge', help='delete old saved sessions of a workspace')
@@ -2748,6 +3013,13 @@ def _run_session_picker(args: argparse.Namespace) -> int:
 
     session_dir = _session_directory_for(args.cwd)
     sessions = list_agent_sessions(session_dir)
+    hidden = 0
+    # --search looks through every session, like /resume <text>: the user is after one particular session
+    if not getattr(args, 'all', False) and not getattr(args, 'search', None):
+        from .session_store import is_user_session
+
+        mine = [s for s in sessions if is_user_session(session_dir, s[0])]
+        hidden, sessions = len(sessions) - len(mine), mine
     if getattr(args, 'search', None):
         from .session_store import search_agent_sessions
 
@@ -2756,9 +3028,11 @@ def _run_session_picker(args: argparse.Namespace) -> int:
             print(f'No saved session mentions {args.search!r}.')
             return 0
     if not sessions:
-        print('No saved sessions found.')
+        print('No saved sessions found.' + (f' {hidden} -p or background session(s) are hidden: --all shows them.'
+                                            if hidden else ''))
         return 0
-    print('Saved sessions (newest first):')
+    print('Saved sessions (newest first):' + (f'  ({hidden} -p or background session(s) hidden: --all shows them)'
+                                              if hidden else ''))
     for index, (session_id, mtime, message_count) in enumerate(sessions):
         stamp = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
         from .session_store import session_first_prompt
@@ -2912,6 +3186,7 @@ def _run_stream_json_input(args: argparse.Namespace, stdin: Any, write: Callable
     from uuid import uuid4
 
     agent = _build_agent(args)
+    agent.new_session_origin = 'print'  # a new -p / stream-json session: hidden from /resume and a chat's -c
     session_id = _take_session_id(agent) or uuid4().hex
     if args.output_format == 'stream-json':
         agent.event_callback = _stream_json_events(agent, args, write)
@@ -2942,7 +3217,7 @@ def _run_stream_json_input(args: argparse.Namespace, stdin: Any, write: Callable
             write(json.dumps({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
                               'result': str(exc), 'session_id': session_id}))
             return 1
-        payload = _result_payload(result, int((time.monotonic() - started) * 1000))
+        payload = _result_payload(_with_side_calls(agent, result), int((time.monotonic() - started) * 1000))
         write(json.dumps(payload, default=str))
         if payload['is_error']:
             exit_code = 1
@@ -3002,6 +3277,7 @@ def _run_print_mode(args: argparse.Namespace, *, stdin: Any = None,
         return 2
     fmt = args.output_format
     agent = _build_agent(args)
+    agent.new_session_origin = 'print'  # a new -p / stream-json session: hidden from /resume and a chat's -c
     session_id = _take_session_id(agent) or uuid4().hex
     if fmt == 'stream-json':
         write(json.dumps({
@@ -3036,7 +3312,7 @@ def _run_print_mode(args: argparse.Namespace, *, stdin: Any = None,
             write(json.dumps({'type': 'result', 'subtype': 'error_during_execution', 'is_error': True,
                               'result': str(exc), 'session_id': session_id}))
         return 1
-    payload = _result_payload(result, int((time.monotonic() - started) * 1000))
+    payload = _result_payload(_with_side_calls(agent, result), int((time.monotonic() - started) * 1000))
     shown = _message_display(agent, result)
     fire_session_end(agent.command_hook_runtime, result.session_id, 'other')
     if fmt == 'text':
@@ -3046,29 +3322,62 @@ def _run_print_mode(args: argparse.Namespace, *, stdin: Any = None,
     return 1 if payload['is_error'] else 0
 
 
-def _is_interactive_chat(raw_argv: list[str]) -> bool:
-    """An interactive chat on a terminal (bare `sigil` or `sigil agent-chat`, not -p / --print)."""
-    if any(arg in ('-p', '--print') for arg in raw_argv):
-        return False
+def _on_terminal() -> bool:
     try:
-        if not (sys.stdin.isatty() and sys.stdout.isatty()):
-            return False
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
     except (AttributeError, ValueError) as _ignored:
         _log_ignored(_ignored)
         return False
+
+
+def _is_interactive_chat(raw_argv: list[str]) -> bool:
+    """An interactive chat on a terminal: bare `sigil` (also -c / -r), `sigil agent-chat` and `sigil sessions`
+    (it opens the chosen session), not -p / --print."""
+    if any(arg in ('-p', '--print') for arg in raw_argv):
+        return False
+    if not _on_terminal():
+        return False
     names = _subcommand_names(build_parser())
     command = next((arg for arg in raw_argv if arg in names), None)
-    return command in (None, 'agent-chat')
+    return command in (None, 'agent-chat', 'sessions')
+
+
+def ask_folder_trust(cwd: str | Path, interactive: bool | None = None) -> bool:
+    """The folder trust question, asked once per folder before any project env, hook or MCP server is used.
+    main() asks it for every interactive start, a resumed chat included. A launcher that builds the agent
+    itself must call it first. On a terminal it asks; otherwise (or interactive=False) it names what it skips.
+    Returns whether the folder's project items may run."""
+    from .workspace_trust import ensure_trust
+
+    ask = input if (_on_terminal() if interactive is None else interactive) else None
+    return ensure_trust(Path(cwd), ask=ask, output=print)
+
+
+def _note_undecided_trust(agent: LocalCodingAgent, output_func: Callable[[str], None]) -> None:
+    """A chat that starts before the trust question was answered for its folder (a launcher that skipped
+    ask_folder_trust) says so, instead of running with the project items quietly off."""
+    from .workspace_trust import status
+
+    try:
+        state, items = status(agent.runtime_config.cwd)
+    except (OSError, ValueError) as exc:
+        _log_ignored(exc)
+        output_func(f'Folder trust could not be read ({type(exc).__name__}), so project items stay off. '
+                    '/trust shows the state.')
+        return
+    if state in ('new', 'changed') and items:
+        what = 'changed since you trusted it' if state == 'changed' else 'was never asked about'
+        output_func(f'This folder {what}, so its {len(items)} project item(s) (hooks, MCP servers, env, '
+                    'settings) are off in this chat. /trust shows them. /trust grant, then restart Sigil, '
+                    'loads them.')
 
 
 def main(argv: list[str] | None = None) -> int:
     _enable_windows_vt()
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     if _is_interactive_chat(raw_argv):
-        from .workspace_trust import ensure_trust
-
-        # asked once per folder, before any project env, hook or MCP server is used
-        ensure_trust(Path(_argv_value(raw_argv, '--cwd') or '.'), ask=input, output=print)
+        # every interactive start, a resumed chat included
+        ask_folder_trust(_argv_value(raw_argv, '--cwd') or '.', interactive=True)
     _apply_user_config(_argv_value(raw_argv, '--cwd') or '.')  # before the parser reads env defaults
     parser = build_parser()
     argv = _translate_print_argv(raw_argv, _subcommand_names(parser))
@@ -3633,8 +3942,9 @@ def main(argv: list[str] | None = None) -> int:
         from .command_hooks import fire_session_end
 
         agent = _build_agent(args)
+        agent.new_session_origin = 'print'  # one-shot `sigil agent`: hidden from /resume and a chat's -c
         result = agent.run(args.prompt)
-        _print_agent_result(result, show_transcript=args.show_transcript)
+        _print_agent_result(_with_side_calls(agent, result), show_transcript=args.show_transcript)
         fire_session_end(agent.command_hook_runtime, result.session_id, 'other')
         return 0
     if args.command == 'agent-bg':
@@ -3756,7 +4066,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == 'agent-resume':
         agent, stored_session = _build_resumed_agent(args)
         result = agent.resume(args.prompt, stored_session)
-        _print_agent_result(result, show_transcript=args.show_transcript)
+        _print_agent_result(_with_side_calls(agent, result), show_transcript=args.show_transcript)
         return 0
     if args.command == 'agent-prompt':
         agent = _build_agent(args)

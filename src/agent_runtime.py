@@ -25,7 +25,7 @@ from .hook_policy import HookPolicyRuntime
 from .command_hooks import CommandHookRuntime, wire_worktree_hooks, worktree_from_hook
 from .lsp_runtime import LSPRuntime
 from .mcp_runtime import MCPRuntime
-from .skills_runtime import SkillsRuntime, initialize_skills_registry
+from .skills_runtime import SkillsRuntime
 from .agent_prompting import (
     build_prompt_context,
     build_system_prompt_parts,
@@ -90,6 +90,10 @@ def _env_positive_int(name: str, default: int) -> int:
 class BudgetDecision:
     exceeded: bool
     reason: str | None = None
+
+
+_USAGE_FIELDS = ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens',
+                 'reasoning_tokens', 'cache_creation_1h_input_tokens')
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,10 @@ class LocalCodingAgent:
     # Why a lock: parallel delegate_agent calls check and raise the count at the same time; without
     # it two threads could both pass the limit check (check-then-increment race).
     _spawn_lock: Any = field(default_factory=lambda: __import__('threading').Lock(), init=False, repr=False)
+    # Side calls (model calls outside the main loop) per session id: (usage, cost, count). None holds
+    # calls made before a session exists; the session that is saved next takes them over.
+    _side_totals: dict = field(default_factory=dict, init=False, repr=False)
+    _side_lock: Any = field(default_factory=lambda: __import__('threading').Lock(), init=False, repr=False)
     
     # Ground-truth tracking for accurate context monitoring
     _last_observed_input_tokens: int = field(default=0, init=False, repr=False)
@@ -252,6 +260,8 @@ class LocalCodingAgent:
     background_ask: Any = field(default=None, repr=False)
     # Subagent frontmatter mcpServers: only these servers' tools are registered (None = all).
     mcp_server_filter: tuple[str, ...] | None = None
+    # The native mcp__<server>__<tool> tools registered last time, replaced as a set on every refresh.
+    _native_mcp_names: set[str] = field(default_factory=set, init=False, repr=False)
     # /memory refresh: the reloaded memory goes with the next prompt.
     pending_memory_reminder: str | None = field(default=None, repr=False)
     # --session-id (used by the first new session) and --fork-session.
@@ -412,16 +422,12 @@ class LocalCodingAgent:
         registry = _register_architect(self, registry)  # opt-in: --architect / SIGIL_ARCHITECT=1
         self.tool_registry = self._apply_cli_tool_limits(registry)
         self.client = make_client(self.model_config)
-        if self.command_hook_runtime is not None and any(
-            hook.type == 'prompt' for hook in self.command_hook_runtime.hooks
-        ):
+        if self.command_hook_runtime is not None:
+            # Always wired: hooks are re-read on every call, so a prompt / mcp_tool / agent hook can
+            # appear in the settings mid-session (command_hooks.refresh).
             self.command_hook_runtime.model_complete = self._complete_for_prompt_hook
-        if self.command_hook_runtime is not None and any(
-            hook.type in ('mcp_tool', 'agent') for hook in self.command_hook_runtime.hooks
-        ):
             self.command_hook_runtime.mcp_call = self._call_tool_for_hook
             self.command_hook_runtime.agent_run = self._run_agent_for_hook
-        if self.command_hook_runtime is not None:
             self.command_hook_runtime.common_fields = self._hook_common_fields
         self.tool_context = build_tool_context(
             self.runtime_config,
@@ -458,6 +464,27 @@ class LocalCodingAgent:
             from .debug_log import log_ignored_error
 
             log_ignored_error(_ignored)
+        if not self.is_subagent:
+            self._start_cache_sweep()
+
+    def _start_cache_sweep(self) -> None:
+        """Explicit caches a crashed run of this install left behind: deleted in the background at
+        start-up, for every endpoint with a usable key (once per process, explicit_cache)."""
+        from .explicit_cache import sweep_at_start
+        from .profiles import _host, host_key_env
+
+        config = self.model_config
+
+        def key_for(base_url: str) -> str | None:
+            # the main key only for its own server; another host needs SIGIL_API_KEY_<HOST>
+            same = _host(base_url) == _host(str(config.base_url))
+            key = str(config.api_key or '') if same else os.environ.get(host_key_env(base_url), '').strip()
+            return key if key and key != 'local-token' else None
+
+        try:
+            sweep_at_start(key_for)
+        except Exception as _ignored:  # start-up never fails over a clean-up
+            _log_ignored(_ignored)
 
     def set_model(self, model: str) -> None:
         previous = self.model_config.model
@@ -466,12 +493,152 @@ class LocalCodingAgent:
                 'session_id': self.active_session_id, 'from_model': previous, 'to_model': model})
             if pre is not None and (pre.blocked or pre.stop):
                 return  # a PreModelSwitch hook said no
-        self.model_config = replace(self.model_config, model=model)
+        from .prompt_cache import reprice
+
+        base_url = str(self.model_config.base_url)
+        # cache prices follow the model (input/output prices stay, as before)
+        self.model_config = replace(self.model_config, model=model, pricing=reprice(
+            self.model_config.pricing, base_url, previous, base_url, model, api_key=str(self.model_config.api_key)))
         self.client = make_client(self.model_config)
         self.tool_context = replace(self.tool_context, model_config=self.model_config)
         if previous != model:
             self._run_hook_event('PostModelSwitch', {
                 'session_id': self.active_session_id, 'from_model': previous, 'to_model': model})
+
+    def _serving_config(self) -> ModelConfig:
+        """The model config of the endpoint that answered the last model call: a fallback model
+        (FallbackClient) has its own model name and cache prices; otherwise the main config."""
+        from .anthropic_client import FallbackClient
+
+        if isinstance(self.client, FallbackClient) and self.client.last_config is not None:
+            return self.client.last_config
+        return self.model_config
+
+    # ------------------------------------------------------------ side calls (usage and cost)
+
+    def record_side_usage(self, usage: UsageStats, *, client: Any = None, config: ModelConfig | None = None,
+                          cost_usd: float | None = None) -> float:
+        """Count one model call made outside the main loop (/btw, a summary, compaction, a hook, the
+        web_fetch prompt, a subagent or the editor) in the session totals, once. It is priced by the
+        model that served it (cost_usd when the caller already priced it, e.g. a child agent's run).
+        Thread-safe (subagents finish on their own threads). Returns the cost added."""
+        from .anthropic_client import FallbackClient
+
+        if config is None and client is not None:
+            last = client.last_config if isinstance(client, FallbackClient) else None
+            config = last or getattr(client, 'config', None)
+        served = config if config is not None else self.model_config
+        cost = float(cost_usd) if cost_usd is not None else served.pricing.estimate_cost_usd(usage)
+        with self._side_lock:
+            key = self.active_session_id
+            total, spent, count = self._side_totals.get(key, (UsageStats(), 0.0, 0))
+            self._side_totals[key] = (total + usage, spent + cost, count + 1)
+            self.cumulative_usage = self.cumulative_usage + usage
+            self.cumulative_cost_usd += cost
+        return cost
+
+    def side_totals(self, session_id: str | None = None) -> tuple[UsageStats, float, int]:
+        """(usage, cost, number of calls) of the side calls counted for a session (default: the
+        active one, with calls made before it existed)."""
+        key = self.active_session_id if session_id is None else session_id
+        with self._side_lock:
+            usage, cost, count = self._side_totals.get(key, (UsageStats(), 0.0, 0))
+            if key is not None:
+                early = self._side_totals.get(None)
+                if early is not None:
+                    usage, cost, count = usage + early[0], cost + early[1], count + early[2]
+        return usage, cost, count
+
+    def _take_over_side_totals(self, stored: Any) -> tuple[UsageStats, float, int]:
+        """The side totals for a stored session: this process's own when it has them (they include
+        everything already saved), else the ones saved in the file."""
+        session_id = getattr(stored, 'session_id', None)
+        with self._side_lock:
+            if session_id not in self._side_totals:
+                self._side_totals[session_id] = (usage_from_payload(getattr(stored, 'side_usage', None)),
+                                                  float(getattr(stored, 'side_cost_usd', 0.0) or 0.0),
+                                                  int(getattr(stored, 'side_call_count', 0) or 0))
+        return self.side_totals(session_id)
+
+    def _side_fields(self, session_id: str | None) -> dict[str, Any]:
+        """The side totals of a session as StoredAgentSession fields. Calls made before the session
+        existed (the None bucket) move into it now, so they are saved exactly once."""
+        with self._side_lock:
+            early = self._side_totals.pop(None, None)
+            usage, cost, count = self._side_totals.get(session_id, (UsageStats(), 0.0, 0))
+            if early is not None:
+                usage, cost, count = usage + early[0], cost + early[1], count + early[2]
+            self._side_totals[session_id] = (usage, cost, count)
+        fields: dict[str, Any] = {'side_usage': usage.to_dict(), 'side_cost_usd': cost, 'side_call_count': count}
+        if not self.is_subagent and session_id:
+            from .explicit_cache import session_storage_usd
+
+            # explicit cache storage of this session (a subagent's caches are counted in its parent's)
+            fields['cache_storage_usd'] = session_storage_usd(session_id)
+        return fields
+
+    def save_side_totals(self) -> None:
+        """Write the active session's side totals to its file now (after /btw, /compact or a rewind
+        summary between prompts), so quitting right after does not lose them."""
+        session_id = self.active_session_id
+        if not session_id:
+            return
+        try:
+            stored = load_agent_session(session_id, directory=self.runtime_config.session_directory)
+        except (OSError, ValueError) as _ignored:
+            _log_ignored(_ignored)
+            return
+        save_agent_session(replace(stored, **self._side_fields(session_id)),
+                           directory=self.runtime_config.session_directory)
+
+    def _record_child_run(self, child: 'LocalCodingAgent', stored: Any = None) -> None:
+        """A child agent's run (subagent, agent hook, editor): what it added to its own totals."""
+        usage, cost = child.cumulative_usage, child.cumulative_cost_usd
+        if stored is not None:  # a resumed child started from its saved totals
+            side_usage = usage_from_payload(getattr(stored, 'side_usage', None))
+            before = usage_from_payload(getattr(stored, 'usage', None)) + side_usage
+            usage = UsageStats(**{name: max(0, getattr(usage, name) - getattr(before, name))
+                                  for name in _USAGE_FIELDS})
+            cost = max(0.0, cost - float(getattr(stored, 'total_cost_usd', 0.0) or 0.0)
+                       - float(getattr(stored, 'side_cost_usd', 0.0) or 0.0))
+        if usage.total_tokens or cost:
+            self.record_side_usage(usage, cost_usd=cost)
+
+    def _record_tool_side_usage(self, tool_result: Any) -> None:
+        """A tool that made its own model call (web_fetch with a prompt) reports it in its metadata."""
+        metadata = getattr(tool_result, 'metadata', None) or {}
+        usage = metadata.get('side_usage')
+        if isinstance(usage, dict):
+            cost = metadata.get('side_cost_usd')
+            self.record_side_usage(usage_from_payload(usage),
+                                   cost_usd=float(cost) if isinstance(cost, (int, float)) else None)
+
+    SUMMARY_NO_TOOLS = ('\n\nAnswer with text only. Do not call any tool: tool calls in this reply are not '
+                        'run.')
+
+    def summary_completion(self, instruction: str, *, session: Any = None, client: Any = None) -> tuple[str, Any]:
+        """A side call that reads the main conversation's prompt cache: the main loop's own tools,
+        system prompt and messages, unchanged and in the same order, from the same client (same
+        model, effort and thinking), plus one user message. tool_choice is not changed (Anthropic:
+        a tool_choice change invalidates the cached messages); the model is told in text not to call
+        tools, and a tool call it makes anyway is never run. A reply without text is asked once
+        more with the instruction repeated (Anthropic compaction docs). Returns (text, last turn);
+        the usage is counted. Model errors are raised to the caller."""
+        client = client if client is not None else self.client
+        session = session if session is not None else self.last_session
+        tool_specs = [tool.to_openai_tool() for tool in self.tool_registry.values()] if self.tool_registry else []
+        messages = list(session.to_openai_messages()) if session is not None else []
+        messages.append({'role': 'user', 'content': instruction + self.SUMMARY_NO_TOOLS})
+        turn = client.complete(messages, tool_specs)
+        self.record_side_usage(turn.usage, client=client)
+        text = turn.content or ''
+        if not text.strip() and turn.tool_calls:
+            messages[-1] = {'role': 'user', 'content': instruction + self.SUMMARY_NO_TOOLS
+                            + ' Your last reply was a tool call; reply again with text only.'}
+            turn = client.complete(messages, tool_specs)
+            self.record_side_usage(turn.usage, client=client)
+            text = turn.content or ''
+        return text, turn
 
     def _fire_instructions_loaded(self, session_id: str) -> None:
         """InstructionsLoaded once per new session, with the memory files in use."""
@@ -506,33 +673,17 @@ class LocalCodingAgent:
 
     def _discover_skills_registry(self) -> Any:
         """Skills and skill-repo agents for this workspace (also used by /reload-skills)."""
-        # Initialize skills registry with cloned repo directories
-        skills_dirs = []
-        agents_dirs = []
-        
-        # Skills repos checked out in the workspace: only the folder names in SIGIL_SKILL_REPOS
-        from .skills_runtime import _skill_repo_names
+        # Why: this used to scan only skill repos, ./.sigil/skills and plugins, so skills in
+        # ~/.sigil/skills, parent folders, .agents/skills and --add-dir folders were listed in
+        # the prompt but skill_get could not load them. Use the same discovery as the prompt.
+        from . import skills_runtime as _skills
 
-        for repo_name in _skill_repo_names():
-            repo = self.runtime_config.cwd / repo_name
-            if repo.exists():
-                skills_dirs.append(repo)
-                if (repo / 'agents').is_dir():
-                    agents_dirs.append(repo / 'agents')
-        
-        # Also check for local skills directory
-        local_skills = self.runtime_config.cwd / '.sigil' / 'skills'
-        if local_skills.exists():
-            skills_dirs.append(local_skills)
-        from .sigil_plugins import loaded_plugins
-
-        for plugin in loaded_plugins():  # --plugin-dir
-            skills_dirs.extend(plugin.skill_dirs)
-        
-        return initialize_skills_registry(
-            skills_dirs=skills_dirs,
-            agents_dirs=agents_dirs,
+        runtime = SkillsRuntime.from_workspace(
+            self.runtime_config.cwd,
+            tuple(str(path) for path in self.runtime_config.additional_working_directories),
         )
+        _skills._global_registry = runtime._registry
+        return runtime._registry
 
     def reload_skills(self) -> int:
         """/reload-skills: read the skill folders again; returns the number of skills."""
@@ -553,6 +704,9 @@ class LocalCodingAgent:
         self.plugin_runtime = PluginRuntime.from_workspace(self.runtime_config.cwd, dirs)
         self.command_hook_runtime = CommandHookRuntime.from_workspace(self.runtime_config.cwd)
         self.command_hook_runtime.common_fields = self._hook_common_fields
+        self.command_hook_runtime.model_complete = self._complete_for_prompt_hook
+        self.command_hook_runtime.mcp_call = self._call_tool_for_hook
+        self.command_hook_runtime.agent_run = self._run_agent_for_hook
         self.mcp_runtime = MCPRuntime.from_workspace(self.runtime_config.cwd, dirs)
         self.tool_context = replace(self.tool_context, mcp_runtime=self.mcp_runtime)
         skills = self.reload_skills()
@@ -567,7 +721,10 @@ class LocalCodingAgent:
 
         return (f'Reloaded: {len(self.plugin_runtime.manifests)} plugin manifest(s), '
                 f'{len(loaded_plugins())} plugin folder(s), {len(self.command_hook_runtime.hooks)} hook(s), '
-                f'{len(self.mcp_runtime.servers)} MCP server(s), {skills} skill(s).')
+                f'{len(self.mcp_runtime.servers)} MCP server(s), {skills} skill(s).'
+                + (f' {len(self.mcp_runtime.skipped_untrusted)} MCP server(s) wait for folder trust '
+                   '(/trust grant, then restart Sigil).'
+                   if self.mcp_runtime.skipped_untrusted else ''))
 
     def _register_auto_memory_tool(self, registry: dict[str, Any]) -> dict[str, Any]:
         """memory_save, only when auto memory is on (see auto_memory.py)."""
@@ -628,11 +785,20 @@ class LocalCodingAgent:
         Weak models handle a direct tool better than "list tools, then call one",
         and permission rules / hook matchers can name it. SIGIL_MCP_NATIVE_TOOLS=0
         keeps only the mcp_list_tools / mcp_call_tool pair.
+
+        A refresh (/mcp disable or enable, a reload) replaces the MCP tools registered before, so a
+        disabled server's tools stop going out with the next model call. Why: they used to stay in the
+        tool list until a restart, still costing their full schemas on every request. The tools that stay
+        keep their place, so a refresh that changes nothing sends the same tool list (the start of every
+        cached prompt, on every provider) and keeps the cache.
         """
         runtime = self.mcp_runtime
+        previous = self._native_mcp_names
+        base = {name: tool for name, tool in registry.items() if name not in previous}
         if runtime is None or not getattr(runtime, 'servers', ()) or \
                 os.environ.get('SIGIL_MCP_NATIVE_TOOLS', '1').strip().lower() in ('0', 'false', 'no', 'off'):
-            return registry
+            self._native_mcp_names = set()
+            return base
         from .mcp_runtime import connection_manager
 
         failed = {name for name, status in connection_manager().status.items() if status.startswith('failed')}
@@ -640,15 +806,17 @@ class LocalCodingAgent:
             tools = runtime.list_tools()
         except Exception as _ignored:
             _log_ignored(_ignored)
-            return registry
-        added = dict(registry)
-        for tool in tools:
+            return registry  # the listing failed: keep the tools that were there
+        fresh: dict[str, Any] = {}
+        # cache buster fix: a fixed order, so the tool list (the start of every cached prompt) is the
+        # same whatever order the servers answered in
+        for tool in sorted(tools, key=lambda t: (str(t.server_name or ''), str(t.name or ''))):
             if tool.server_name in failed:
                 continue
             if self.mcp_server_filter is not None and tool.server_name not in self.mcp_server_filter:
                 continue
             name = native_mcp_tool_name(tool.server_name, tool.name)
-            if name in added:
+            if name in base or name in fresh:
                 continue
             schema = tool.input_schema if isinstance(tool.input_schema, dict) and tool.input_schema else {
                 'type': 'object', 'properties': {}}
@@ -658,12 +826,22 @@ class LocalCodingAgent:
                     raise RuntimeError('MCP is not available in this runtime')
                 return context.mcp_runtime.call_tool(_tool.name, arguments=arguments, server_name=_tool.server_name)
 
-            added[name] = SigilTool(
+            fresh[name] = SigilTool(
                 name=name,
                 description=(tool.description or f'MCP tool {tool.name} from server {tool.server_name}')[:1024],
                 parameters=schema,
                 handler=_handler,
             )
+        # tools that stay keep their place, a removed one drops out, a new one goes at the end
+        added: dict[str, Any] = {}
+        for name, existing in registry.items():
+            if name not in previous:
+                added[name] = existing
+            elif name in fresh:
+                added[name] = fresh[name]
+        for name, tool in fresh.items():
+            added.setdefault(name, tool)
+        self._native_mcp_names = set(fresh)
         return added
 
     def _apply_cli_tool_limits(self, registry: dict[str, Any]) -> dict[str, Any]:
@@ -1001,14 +1179,14 @@ class LocalCodingAgent:
             return Path(hook_path)
         from .worktree_runtime import git_kwargs
 
-        check = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=root, capture_output=True, text=True,
+        check = subprocess.run(['git', 'rev-parse', '--show-toplevel'], cwd=root, capture_output=True, text=True, encoding='utf-8', errors='replace',
                                **git_kwargs())
         if check.returncode != 0:
             raise RuntimeError('isolation: worktree needs the workspace to be a git repository')
         path = root / '.port_sessions' / 'worktrees' / name
         path.parent.mkdir(parents=True, exist_ok=True)
         added = subprocess.run(['git', 'worktree', 'add', '-b', f'sigil/{name}', str(path), 'HEAD'],
-                               cwd=root, capture_output=True, text=True, **git_kwargs())
+                               cwd=root, capture_output=True, text=True, encoding='utf-8', errors='replace', **git_kwargs())
         if added.returncode != 0:
             raise RuntimeError(f'git worktree add failed: {added.stderr.strip()}')
         return path
@@ -1022,13 +1200,16 @@ class LocalCodingAgent:
             return f'{path} (made by the WorktreeCreate hook; kept)'
         from .worktree_runtime import git_kwargs
 
-        status = subprocess.run(['git', 'status', '--porcelain'], cwd=path, capture_output=True, text=True,
+        status = subprocess.run(['git', 'status', '--porcelain'], cwd=path, capture_output=True, text=True, encoding='utf-8', errors='replace',
                                 **git_kwargs())
         branch = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=path, capture_output=True,
-                                text=True, **git_kwargs()).stdout.strip()
+                                text=True, encoding='utf-8', errors='replace', **git_kwargs()).stdout.strip()
         if status.returncode == 0 and not status.stdout.strip():
-            subprocess.run(['git', 'worktree', 'remove', '--force', str(path)], cwd=self.runtime_config.cwd,
-                           capture_output=True, **git_kwargs())
+            removed = subprocess.run(['git', 'worktree', 'remove', '--force', str(path)],
+                                     cwd=self.runtime_config.cwd, capture_output=True, text=True, encoding='utf-8', errors='replace', **git_kwargs())
+            if removed.returncode != 0:
+                # Why: a failed remove used to be reported as 'removed'.
+                return f'{path} (no changes, but git worktree remove failed: {removed.stderr.strip()})'
             subprocess.run(['git', 'branch', '-D', branch], cwd=self.runtime_config.cwd, capture_output=True,
                            **git_kwargs())
             return 'removed (no changes)'
@@ -1174,6 +1355,10 @@ class LocalCodingAgent:
         self.last_session_path = None
         self.resume_source_session_id = None
         self.subagent_spawn_count = 0
+        if not self.is_subagent:
+            from .explicit_cache import reset_session_storage
+
+            reset_session_storage()  # the next session counts its own explicit cache storage
         if self.plugin_runtime is not None:
             self.plugin_runtime.restore_session_state({})
 
@@ -1414,6 +1599,7 @@ class LocalCodingAgent:
         # [RECURSIVE-MEMORY] Instead of just deleting (pruning), we use the LLM to summarize.
         # This is "Recursive Memory" - the agent remembers the past even if the raw messages are gone.
         self.last_session = session
+        self._take_over_side_totals(stored_session)  # the summary's usage joins the session's side totals
         compact_result = compact_conversation(self, custom_instructions, trigger='manual')
 
         if compact_result.error:
@@ -1442,14 +1628,13 @@ class LocalCodingAgent:
             tool_specs=tool_specs,
             max_tokens_override=self.runtime_config.auto_compact_threshold_tokens,
         )
-        new_usage_dict = {
-            'input_tokens': usage_report.total_tokens,
-            'output_tokens': 0,
-            'total_tokens': usage_report.total_tokens,
-        }
+        # why: the session's real token and cache totals stay; only the context estimate is new
+        # (it used to replace `usage`, so /cost and /cache lost everything after /compact)
+        new_usage_dict = {**dict(stored_session.usage or {}), 'context_tokens': usage_report.total_tokens}
 
         # [PERSIST] Save the compacted state back to the store
         compacted_payload = StoredAgentSession(
+            origin=getattr(stored_session, 'origin', '') or self._origin_for_save(),
             session_id=stored_session.session_id,
             model_config=serialize_model_config(self.model_config),
             runtime_config=dataclasses.asdict(self.runtime_config),
@@ -1469,6 +1654,7 @@ class LocalCodingAgent:
             scratchpad_directory=stored_session.scratchpad_directory,
             current_turn=stored_session.current_turn,
             file_access_history=dict(stored_session.file_access_history),
+            **self._side_fields(stored_session.session_id),
         )
         save_agent_session(
             compacted_payload,
@@ -1476,20 +1662,23 @@ class LocalCodingAgent:
         )
         return compact_result
 
+    def _origin_for_save(self) -> str:
+        """chat or background when the entry point says so (main.py). A resumed session keeps its origin
+        unless this run sets one, so a -p session continued in a chat becomes chat. A new session takes
+        new_session_origin (print for -p, stream-json and one-shot commands). Anything else is saved with no
+        origin and counts as the user's: an entry point that forgets to say shows its sessions, never hides them."""
+        return (getattr(self, 'session_origin', '') or getattr(self, '_resumed_origin', '')
+                or getattr(self, 'new_session_origin', '') or '')
+
     def resume(self, prompt: str, stored_session: StoredAgentSession) -> AgentRunResult:
+        self._resumed_origin = getattr(stored_session, 'origin', '') or ''
         self.managed_agent_id = None
         self.resume_source_session_id = stored_session.session_id
         
         # [PERSISTENCE] Restore last known usage to trigger immediate compaction if needed
         from .agent_types import UsageStats, AgentRunResult
-        usage_data = stored_session.usage
-        last_usage = UsageStats(
-            input_tokens=usage_data.get('input_tokens', 0),
-            output_tokens=usage_data.get('output_tokens', 0),
-            cache_creation_input_tokens=usage_data.get('cache_creation_input_tokens', 0),
-            cache_read_input_tokens=usage_data.get('cache_read_input_tokens', 0),
-            reasoning_tokens=usage_data.get('reasoning_tokens', 0),
-        )
+        # usage_from_payload: every field (the 1-hour cache writes too), 0 for keys an older session lacks
+        last_usage = usage_from_payload(stored_session.usage)
         self.last_run_result = AgentRunResult(
             final_output='',
             session_id=stored_session.session_id,
@@ -1514,11 +1703,21 @@ class LocalCodingAgent:
             session,
             stored_session.file_history,
         )
+        self._append_mcp_status_if_changed(session)
         self._append_compaction_replay_if_needed(session)
         self.active_session_id = stored_session.session_id
         self.last_session = session
-        self.cumulative_usage = last_usage
-        self.cumulative_cost_usd = stored_session.total_cost_usd
+        # The session's side calls: this process's own count when it has one for this session
+        # (it is never older than the file), else the file's.
+        side_usage, side_cost, _count = self._take_over_side_totals(stored_session)
+        if not self.is_subagent:
+            from .explicit_cache import adopt_session_storage
+
+            # the session's explicit cache storage so far (-c, -r, /resume, agent-resume); the same
+            # session resumed again in this process keeps its count
+            adopt_session_storage(stored_session.session_id, getattr(stored_session, 'cache_storage_usd', 0.0))
+        self.cumulative_usage = last_usage + side_usage
+        self.cumulative_cost_usd = stored_session.total_cost_usd + side_cost
         self.last_session_path = str(
             self.runtime_config.session_directory / f'{stored_session.session_id}.json'
         )
@@ -1633,6 +1832,10 @@ class LocalCodingAgent:
                     else {}
                 )
                 starting_model_calls = int(budget_state.get('model_calls', 0)) if isinstance(budget_state.get('model_calls', 0), int) else 0
+        # The result's usage and cost start from these totals; _accumulate_usage adds only what this
+        # run added (a resumed session's earlier usage was counted twice in /cost, /stats and /cache).
+        self._run_starting_usage = starting_usage
+        self._run_starting_cost_usd = starting_cost_usd
 
         slash_result = preprocess_slash_command(self, prompt)
         if slash_result.handled and not slash_result.should_query:
@@ -1818,6 +2021,8 @@ class LocalCodingAgent:
                 self._inject_queued_messages(session, stream_events, turn_index)
                 # [MICROCOMPACT] Offload bulky older tool
                 # results to disk, keeping a small hot tail inline.
+                from .microcompact import cache_friendly_batch
+
                 micro = microcompact_session(
                     session,
                     (
@@ -1825,6 +2030,8 @@ class LocalCodingAgent:
                         if scratchpad_directory is not None
                         else self.runtime_config.cwd / '.port_sessions' / 'tool-results' / session_id
                     ),
+                    # cache buster fix: one old result moved per turn re-wrote the cache every turn
+                    batch=cache_friendly_batch(getattr(self, '_last_model_call_at', None), time.monotonic()),
                 )
                 if micro.offloaded_count:
                     self._last_observed_input_tokens = 0
@@ -1854,6 +2061,7 @@ class LocalCodingAgent:
 
                     # Convert session state to StoredAgentSession for compact()
                     stored = StoredAgentSession(
+                        origin=self._origin_for_save(),
                         session_id=session_id,
                         model_config=serialize_model_config(self.model_config),
                         runtime_config=dataclasses.asdict(self.runtime_config),
@@ -1907,7 +2115,8 @@ class LocalCodingAgent:
                 )
                 if preflight.usage_increment.total_tokens or preflight.model_calls_increment:
                     total_usage = total_usage + preflight.usage_increment
-                    total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
+                    # each call adds its own cost: a later model switch never reprices earlier turns
+                    total_cost_usd += self.model_config.pricing.estimate_cost_usd(preflight.usage_increment)
                     model_calls += preflight.model_calls_increment
                     budget_after_preflight = self._check_budget(
                         total_usage,
@@ -2011,7 +2220,7 @@ class LocalCodingAgent:
                                 'type': 'reactive_compact_retry',
                                 'turn_index': turn_index,
                             })
-                            self._last_observed_input_tokens = turn.usage.input_tokens
+                            self._last_observed_input_tokens = turn.usage.prompt_tokens
                             self._last_observed_message_count = len(session.messages)
 
                     if not recovered:
@@ -2045,14 +2254,21 @@ class LocalCodingAgent:
                 for _te in turn_events:
                     stream_events.append(_te.to_dict())
                 model_calls += 1
-                last_turn_input_tokens = turn.usage.input_tokens
+                last_turn_input_tokens = turn.usage.prompt_tokens
                 total_usage = total_usage + turn.usage
-                total_cost_usd = self.model_config.pricing.estimate_cost_usd(total_usage)
+                self._last_model_call_at = time.monotonic()  # prompt cache age (microcompact batching)
+                served_by = self._serving_config()
+                turn_cost_usd = served_by.pricing.estimate_cost_usd(turn.usage)
+                total_cost_usd += turn_cost_usd  # per call, priced by the endpoint that answered
                 stream_events.append({
-                    'type': 'model_usage', 'turn_index': turn_index, 'model': self.model_config.model,
+                    'type': 'model_usage', 'turn_index': turn_index, 'model': served_by.model,
                     'input_tokens': turn.usage.input_tokens, 'output_tokens': turn.usage.output_tokens,
                     'cache_read_input_tokens': turn.usage.cache_read_input_tokens,
-                    'cost_usd': self.model_config.pricing.estimate_cost_usd(turn.usage),
+                    'cache_creation_input_tokens': turn.usage.cache_creation_input_tokens,
+                    'cache_creation_1h_input_tokens': turn.usage.cache_creation_1h_input_tokens,
+                    'cache_hit_rate': (None if turn.usage.cache_hit_rate is None
+                                       else round(turn.usage.cache_hit_rate, 4)),
+                    'cost_usd': turn_cost_usd,
                 })
                 last_content = turn.content
 
@@ -2860,6 +3076,7 @@ class LocalCodingAgent:
                                 'preflight_count': len(plugin_preflight_messages),
                             }
                         )
+                    self._record_tool_side_usage(tool_result)
                     self._refresh_runtime_views_for_tool_result(tool_call.name, tool_result)
                     history_entry = self._build_file_history_entry(
                         tool_call=tool_call,
@@ -2914,6 +3131,7 @@ class LocalCodingAgent:
             
             # Create a dedicated StoredAgentSession for the backup
             backup_state = StoredAgentSession(
+                origin=self._origin_for_save(),
                 session_id=session_id,
                 model_config=serialize_model_config(self.model_config),
                 runtime_config=dataclasses.asdict(self.runtime_config),
@@ -2944,8 +3162,10 @@ class LocalCodingAgent:
                 ),
                 current_turn=session.current_turn,
                 file_access_history=dict(session.file_access_history),
+                # why: this is also written as the session file, which lost the side totals
+                **self._side_fields(session_id),
             )
-            
+
             # Emergency backup beside the session folder (not into the user's project, and not
             # inside the folder, where it would be listed as a session); `-r backup` reads it.
             backup_dir = (Path(self.runtime_config.session_directory).parent
@@ -3137,10 +3357,14 @@ class LocalCodingAgent:
         print(f'\033[2m[thinking] {text}\033[0m', flush=True)
 
     def _keep_original_content(self, session: AgentSessionState, index: int) -> None:
-        """Native Messages API: keep the reply's thinking blocks so they go back with the tool results."""
+        """Native Messages API: keep the reply's thinking blocks so they go back with the tool results.
+        OpenAI-compatible: keep reasoning_content and thought signatures the provider needs back."""
         pop = getattr(self.client, 'pop_original_content', None)
         if callable(pop):
             session.set_assistant_original_content(index, pop())
+        pop_replay = getattr(self.client, 'pop_replay', None)
+        if callable(pop_replay):
+            session.set_assistant_replay(index, pop_replay())
 
     def _postprocess_turn(self, turn: AssistantTurn) -> AssistantTurn:
         """Take out <think>/reasoning text and read tool calls written as text."""
@@ -3221,6 +3445,13 @@ class LocalCodingAgent:
         session_turns: int,
     ) -> BudgetDecision:
         budget = self.runtime_config.budget_config
+        # side calls (summaries, hooks, subagents, the web_fetch prompt) count against the budget too
+        side_usage, side_cost, _calls = self.side_totals()
+        usage = usage + side_usage
+        from .explicit_cache import storage_cost_usd
+
+        # explicit cache storage (Gemini, Vertex) of this process counts too; /cost shows it in the total
+        total_cost_usd = total_cost_usd + side_cost + storage_cost_usd()
         token_reason = self._check_token_budget(usage, budget)
         if token_reason is not None:
             return BudgetDecision(exceeded=True, reason=token_reason)
@@ -3394,10 +3625,9 @@ class LocalCodingAgent:
                         }
                     )
                     if not recovered.exceeds_soft_limit and not recovered.exceeds_hard_limit:
-                        return PromptPreflightResult(
-                            usage_increment=compact_result.usage,
-                            model_calls_increment=1,
-                        )
+                        # the summary's usage and cost were counted by compact_conversation
+                        # (a side call, priced by the model that wrote it)
+                        return PromptPreflightResult(model_calls_increment=1)
                     snapshot = recovered
                 else:
                     stream_events.append(
@@ -3797,10 +4027,10 @@ class LocalCodingAgent:
                 'Stopped because the total token budget was exceeded '
                 f'({usage.total_tokens} > {budget.max_total_tokens}).'
             )
-        if budget.max_input_tokens is not None and budget.max_input_tokens > 0 and usage.input_tokens > budget.max_input_tokens:
+        if budget.max_input_tokens is not None and budget.max_input_tokens > 0 and usage.prompt_tokens > budget.max_input_tokens:
             return (
                 'Stopped because the input token budget was exceeded '
-                f'({usage.input_tokens} > {budget.max_input_tokens}).'
+                f'({usage.prompt_tokens} > {budget.max_input_tokens}).'
             )
         if budget.max_output_tokens is not None and budget.max_output_tokens > 0 and usage.output_tokens > budget.max_output_tokens:
             return (
@@ -4303,7 +4533,11 @@ class LocalCodingAgent:
                 child_runtime_config = replace(child_runtime_config, permissions=AgentPermissions())
             child_model = resolve_model_alias(definition.model)
             if child_model:
-                child_model_config = replace(self.model_config, model=child_model)
+                from .prompt_cache import reprice
+
+                child_model_config = replace(self.model_config, model=child_model, pricing=reprice(
+                    self.model_config.pricing, str(self.model_config.base_url), self.model_config.model,
+                    str(self.model_config.base_url), child_model, api_key=str(self.model_config.api_key)))
             if definition.prompt:
                 child_append_prompt = '\n\n'.join(
                     part for part in (self.append_system_prompt, definition.prompt) if part
@@ -4517,6 +4751,7 @@ class LocalCodingAgent:
                 resume_session_id = subtask.get('resume_session_id')
                 resume_used = False
                 cur_child_result = None
+                stored_child_session = None
                 
                 try:
                     if isinstance(resume_session_id, str) and resume_session_id and (
@@ -4558,6 +4793,8 @@ class LocalCodingAgent:
                         session_id=str(resume_session_id) if resume_session_id else None,
                     )
 
+                # the child's model calls (and its own side calls) count in this session's totals
+                self._record_child_run(child_agent, stored_child_session)
                 with state_lock:
                     child_result = cur_child_result
                     summary = {
@@ -5038,6 +5275,38 @@ class LocalCodingAgent:
         scratchpad_directory.mkdir(parents=True, exist_ok=True)
         return scratchpad_directory
 
+    def _append_mcp_status_if_changed(self, session: AgentSessionState) -> None:
+        """On resume, tell the model when the MCP servers differ from what the conversation last said.
+
+        Why: the MCP summary is written into the session's first message when it starts and is replayed
+        unchanged, so a resumed session could still list servers that folder trust has since left out
+        (or miss ones it now allows). The earlier messages are not edited: that would change the cached
+        prompt and break replayed thinking. A note is appended instead, only when the status changed."""
+        from .agent_context import refresh_mcp_context
+
+        refreshed = refresh_mcp_context(
+            {}, self.runtime_config.cwd, tuple(self.runtime_config.additional_working_directories),
+        )
+        if refreshed is None:  # could not read the MCP config (logged): say nothing rather than guess
+            return
+        current = refreshed.get('mcpRuntime', '')
+        last = session.user_context.get('mcpRuntime', '')
+        for message in reversed(session.messages):
+            if message.metadata.get('kind') == 'mcp_status':
+                last = str(message.metadata.get('mcp_summary') or '')
+                break
+        if current == last:
+            return
+        session.user_context['mcpRuntime'] = current
+        body = current or 'No MCP servers are configured for this folder now.'
+        session.append_user(
+            '<system-reminder>\nThe MCP servers changed since this conversation last described them. '
+            'This is the status now, and it replaces the earlier MCP summary:\n'
+            f'{body}\n</system-reminder>',
+            metadata={'kind': 'mcp_status', 'mcp_summary': current},
+            message_id=f'mcp_status_{len(session.messages)}',
+        )
+
     def _append_file_history_replay_if_needed(
         self,
         session: AgentSessionState,
@@ -5478,6 +5747,7 @@ class LocalCodingAgent:
             'session_turns': previous_session_turns + result.turns,
         }
         stored = StoredAgentSession(
+            origin=self._origin_for_save(),
             session_id=result.session_id,
             model_config=serialize_model_config(self.model_config),
             runtime_config=dataclasses.asdict(self.runtime_config),
@@ -5500,6 +5770,7 @@ class LocalCodingAgent:
             scratchpad_directory=result.scratchpad_directory,
             current_turn=session.current_turn,
             file_access_history=dict(session.file_access_history),
+            **self._side_fields(result.session_id),
         )
         path = save_agent_session(
             stored,
@@ -6083,6 +6354,7 @@ class LocalCodingAgent:
             [{'role': 'system', 'content': system}, {'role': 'user', 'content': prompt}],
             tools=[],
         )
+        self.record_side_usage(turn.usage, client=client)
         return turn.content or ''
 
     def answer_elicitation(self, server_name: str, params: dict[str, Any],
@@ -6166,7 +6438,9 @@ class LocalCodingAgent:
             tool_registry=read_only,
             is_subagent=True,
         )
-        return checker.run(prompt).final_output or ''
+        result = checker.run(prompt)
+        self._record_child_run(checker)
+        return result.final_output or ''
 
     def _hook_common_fields(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         """Input fields every hook gets (the common hook input fields).
@@ -6273,6 +6547,9 @@ class LocalCodingAgent:
                 lines.append(f'- MCP local resources: {len(self.mcp_runtime.resources)}')
             if self.mcp_runtime.servers:
                 lines.append(f'- MCP servers: {len(self.mcp_runtime.servers)}')
+            if self.mcp_runtime.skipped_untrusted:
+                lines.append(f'- MCP servers waiting for folder trust: {len(self.mcp_runtime.skipped_untrusted)} '
+                             '(/trust grant, then restart Sigil)')
         if self.remote_runtime is not None and self.remote_runtime.has_remote_config():
             lines.append(f'- Remote profiles: {len(self.remote_runtime.profiles)}')
             if self.remote_runtime.active_connection is not None:
@@ -6360,9 +6637,17 @@ class LocalCodingAgent:
         self.resume_source_session_id = None
 
     def _accumulate_usage(self, result: AgentRunResult) -> None:
-        """Add a run's usage to the cumulative session totals."""
-        self.cumulative_usage = self.cumulative_usage + result.usage
-        self.cumulative_cost_usd += result.total_cost_usd
+        """Add a run's usage to the cumulative session totals. A resumed run's result starts from the
+        stored session totals (already in cumulative_usage), so only the part it added is counted."""
+        start = getattr(self, '_run_starting_usage', None) or UsageStats()
+        added = UsageStats(**{name: max(0, getattr(result.usage, name) - getattr(start, name))
+                              for name in ('input_tokens', 'output_tokens', 'cache_creation_input_tokens',
+                                           'cache_read_input_tokens', 'reasoning_tokens',
+                                           'cache_creation_1h_input_tokens')})
+        self.cumulative_usage = self.cumulative_usage + added
+        self.cumulative_cost_usd += max(0.0, result.total_cost_usd - (getattr(self, '_run_starting_cost_usd', 0.0) or 0.0))
+        self._run_starting_usage = None
+        self._run_starting_cost_usd = 0.0
 
     def _refresh_runtime_views_for_tool_result(
         self,
